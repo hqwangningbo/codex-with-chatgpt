@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { ensureDir, getStateDir } from "../config/paths.js";
 import { findBridgeObservation, findLiveBridge, type RuntimeState } from "../bridge/runtime.js";
 import { Workspace } from "../workspace/manager.js";
+import { SERVICE_NAME } from "../version.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -99,6 +100,34 @@ export async function adminFetch<T = unknown>(
   }
 }
 
+export async function verifyPublicConnection(
+  publicUrl: string,
+  workspaceId: string,
+  fetchImpl: typeof fetch = fetch
+): Promise<void> {
+  const health = await fetchImpl(`${publicUrl}/health`, { signal: AbortSignal.timeout(8000) });
+  if (!health.ok) throw new Error(`Tunnel health check returned HTTP ${health.status}`);
+  const payload = (await health.json().catch(() => null)) as {
+    service?: string;
+    workspaceId?: string;
+    status?: string;
+  } | null;
+  if (payload?.service !== SERVICE_NAME || payload.status !== "ok" || payload.workspaceId !== workspaceId) {
+    throw new Error("Tunnel health check returned the wrong service or workspace");
+  }
+  const mcp = await fetchImpl(`${publicUrl}/mcp`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", method: "ping", id: 1 }),
+    signal: AbortSignal.timeout(8000),
+  });
+  if (mcp.status !== 401) {
+    await mcp.body?.cancel().catch(() => undefined);
+    throw new Error(`Public MCP check returned HTTP ${mcp.status}, expected OAuth 401`);
+  }
+  await mcp.body?.cancel().catch(() => undefined);
+}
+
 export async function verifyPublicConnectionOrStop(
   runtime: RuntimeState,
   publicUrl: string,
@@ -106,23 +135,7 @@ export async function verifyPublicConnectionOrStop(
   fetchImpl: typeof fetch = fetch
 ): Promise<void> {
   try {
-    const health = await fetchImpl(`${publicUrl}/health`, { signal: AbortSignal.timeout(8000) });
-    if (!health.ok) throw new Error(`Tunnel health check returned HTTP ${health.status}`);
-    const payload = (await health.json().catch(() => null)) as { workspaceId?: string; status?: string } | null;
-    if (payload?.status !== "ok" || payload.workspaceId !== workspaceId) {
-      throw new Error("Tunnel health check returned the wrong workspace");
-    }
-    const mcp = await fetchImpl(`${publicUrl}/mcp`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ jsonrpc: "2.0", method: "ping", id: 1 }),
-      signal: AbortSignal.timeout(8000),
-    });
-    if (mcp.status !== 401) {
-      await mcp.body?.cancel().catch(() => undefined);
-      throw new Error(`Public MCP check returned HTTP ${mcp.status}, expected OAuth 401`);
-    }
-    await mcp.body?.cancel().catch(() => undefined);
+    await verifyPublicConnection(publicUrl, workspaceId, fetchImpl);
   } catch (error) {
     try {
       await adminFetch(runtime, "POST", "/admin/tunnel/stop", 5000);
@@ -140,6 +153,25 @@ export async function verifyPublicConnectionOrStop(
     }
     throw error;
   }
+}
+
+export async function startTunnelAndVerify(
+  runtime: RuntimeState,
+  workspaceId: string,
+  fetchImpl: typeof fetch = fetch
+): Promise<string> {
+  const started = await adminFetch<{ url?: string; message?: string }>(
+    runtime,
+    "POST",
+    "/admin/tunnel/start",
+    90_000
+  );
+  if (!started.url) {
+    await adminFetch(runtime, "POST", "/admin/tunnel/stop", 5000).catch(() => undefined);
+    throw new Error(started.message ?? "Tunnel start failed");
+  }
+  await verifyPublicConnectionOrStop(runtime, started.url, workspaceId, fetchImpl);
+  return started.url;
 }
 
 export async function stopBridge(workspaceRoot: string): Promise<boolean> {

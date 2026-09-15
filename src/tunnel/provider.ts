@@ -1,3 +1,5 @@
+import type { ChildProcess } from "node:child_process";
+
 /**
  * Tunnel abstraction. Business logic never talks to a specific vendor;
  * it only sees this interface. V1 ships a Cloudflare Quick Tunnel provider,
@@ -29,6 +31,36 @@ export interface TunnelProvider {
   status(): TunnelStatus;
   getPublicUrl(): string | null;
   doctor(): Promise<TunnelDoctorReport>;
+}
+
+export async function terminateTunnelProcess(child: ChildProcess, timeoutMs = 5000): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error("Tunnel process did not stop after SIGTERM"));
+    }, timeoutMs);
+    const cleanup = (): void => {
+      clearTimeout(timer);
+      child.off("exit", onExit);
+      child.off("error", onError);
+    };
+    const onExit = (): void => {
+      cleanup();
+      resolve();
+    };
+    const onError = (error: Error): void => {
+      cleanup();
+      reject(error);
+    };
+    child.once("exit", onExit);
+    child.once("error", onError);
+    try {
+      child.kill("SIGTERM");
+    } catch (error) {
+      onError(error as Error);
+    }
+  });
 }
 
 export class UnavailableTunnel implements TunnelProvider {

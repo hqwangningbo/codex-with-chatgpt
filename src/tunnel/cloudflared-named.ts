@@ -4,7 +4,7 @@ import type { Logger } from "../logger/index.js";
 import { nullLogger } from "../logger/index.js";
 import { findBinary } from "./detect.js";
 import { tunnelProtocolArgs } from "./protocol.js";
-import type { TunnelDoctorReport, TunnelProvider, TunnelStatus } from "./provider.js";
+import { terminateTunnelProcess, type TunnelDoctorReport, type TunnelProvider, type TunnelStatus } from "./provider.js";
 
 const CONNECTED_RE = /registered tunnel connection/i;
 const HOSTNAME_RE = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i;
@@ -152,11 +152,10 @@ export class CloudflaredNamedTunnel implements TunnelProvider {
   }
 
   async stop(): Promise<void> {
-    if (this.child) {
-      this.child.kill("SIGTERM");
-      this.child = null;
-    }
+    const child = this.child;
     this.connected = false;
+    if (child) await terminateTunnelProcess(child);
+    if (this.child === child) this.child = null;
   }
 
   async restart(localPort: number): Promise<string> {

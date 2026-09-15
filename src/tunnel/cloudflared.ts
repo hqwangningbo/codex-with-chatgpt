@@ -4,7 +4,7 @@ import type { Logger } from "../logger/index.js";
 import { nullLogger } from "../logger/index.js";
 import { SERVICE_NAME } from "../version.js";
 import { findBinary } from "./detect.js";
-import type { TunnelDoctorReport, TunnelProvider, TunnelStatus } from "./provider.js";
+import { terminateTunnelProcess, type TunnelDoctorReport, type TunnelProvider, type TunnelStatus } from "./provider.js";
 import { tunnelProtocolArgs } from "./protocol.js";
 
 const QUICK_TUNNEL_URL_RE = /https:\/\/[^\s|]+/gi;
@@ -268,15 +268,11 @@ export class CloudflaredQuickTunnel implements TunnelProvider {
   }
 
   async stop(): Promise<void> {
+    const child = this.child;
+    const stopped = child ? terminateTunnelProcess(child) : Promise.resolve();
     this.cancelStart?.();
-    if (this.child) {
-      try {
-        this.child.kill("SIGTERM");
-      } catch {
-        // The process may have exited between the state check and kill().
-      }
-      this.child = null;
-    }
+    await stopped;
+    if (this.child === child) this.child = null;
     this.url = null;
     this.lastError = null;
   }

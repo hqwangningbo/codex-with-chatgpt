@@ -36,6 +36,13 @@ afterAll(() => {
 });
 
 describe("manual setup", () => {
+  it("requires a Tunnel choice before starting the Bridge by default", () => {
+    const result = runCli(["setup", "--json", "-w", workspace]);
+    expect(result.status).toBe(1);
+    expect(JSON.parse(result.stdout)).toMatchObject({ ok: false, error: "TUNNEL_CHOICE_REQUIRED" });
+    expect(JSON.parse(runCli(["status", "--json", "-w", workspace]).stdout).state).toBe("stopped");
+  });
+
   it("prepares Connector information without minting pairing credentials or changing Codex config", () => {
     const result = runCli(["setup", "--no-tunnel", "--json", "-w", workspace]);
     expect(result.status, result.stderr).toBe(0);

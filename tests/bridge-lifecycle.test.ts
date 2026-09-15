@@ -38,7 +38,7 @@ describe("Bridge CLI lifecycle", () => {
       state: "stopped",
       workspace: { name: "Lifecycle" },
       bridge: { healthy: false, pid: null },
-      tunnel: { running: false },
+      tunnel: { running: false, verified: false },
     });
 
     const first = runCli(["start", "--json", "-w", workspace]);
@@ -56,7 +56,7 @@ describe("Bridge CLI lifecycle", () => {
       state: "healthy",
       workspace: { name: "Lifecycle" },
       bridge: { healthy: true, port: firstStart.port },
-      tunnel: { running: false },
+      tunnel: { running: false, verified: false },
       mcpUrl: null,
     });
     expect(running.stdout).not.toMatch(/adminToken|accessToken|refreshToken|pairing|credential/i);
@@ -69,11 +69,11 @@ describe("Bridge CLI lifecycle", () => {
     const rejectedTunnel = runCli(["start", "--tunnel", "--json", "-w", workspace]);
     expect(rejectedTunnel.status).toBe(1);
     expect(JSON.parse(rejectedTunnel.stdout)).toMatchObject({ ok: false, error: "TUNNEL_CHOICE_REQUIRED" });
-    const localOnly = JSON.parse(runCli(["status", "--json", "-w", workspace]).stdout);
-    expect(localOnly).toMatchObject({
-      state: "healthy",
-      bridge: { healthy: true },
-      tunnel: { running: false, provider: "unconfigured" },
+    const afterRejectedTunnel = JSON.parse(runCli(["status", "--json", "-w", workspace]).stdout);
+    expect(afterRejectedTunnel).toMatchObject({
+      state: "stopped",
+      bridge: { healthy: false },
+      tunnel: { running: false, verified: false },
       mcpUrl: null,
     });
   });

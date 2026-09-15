@@ -46,7 +46,7 @@ class FakeTunnel implements TunnelProvider {
 }
 
 describe("public Tunnel verification cleanup", () => {
-  it.each(["unreachable", "wrong-workspace", "wrong-mcp"] as const)(
+  it.each(["unreachable", "wrong-service", "wrong-workspace", "wrong-mcp"] as const)(
     "stops and clears the Tunnel after %s verification failure",
     async (failure) => {
       const root = makeTmpDir("tunnel-cleanup");
@@ -78,6 +78,7 @@ describe("public Tunnel verification cleanup", () => {
           if (String(input).endsWith("/health")) {
             return new Response(
               JSON.stringify({
+                service: failure === "wrong-service" ? "other-service" : SERVICE_NAME,
                 status: "ok",
                 workspaceId: failure === "wrong-workspace" ? "wrong-workspace" : bridge.workspace.id,
               }),

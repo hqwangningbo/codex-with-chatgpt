@@ -194,11 +194,17 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   });
 
   app.post("/admin/tunnel/stop", adminGuard, (_req, res) => {
-    void tunnel.stop().then(() => {
-      publicBaseUrl = null;
-      persistRuntime();
-      res.json({ stopped: true });
-    });
+    void tunnel
+      .stop()
+      .then(() => {
+        publicBaseUrl = null;
+        persistRuntime();
+        res.json({ stopped: true });
+      })
+      .catch((error: Error) => {
+        logger.error(`Tunnel stop failed: ${error.message}`);
+        res.status(500).json({ error: "tunnel_stop_failed", message: error.message });
+      });
   });
 
   app.post("/admin/revoke-all", adminGuard, (_req, res) => {

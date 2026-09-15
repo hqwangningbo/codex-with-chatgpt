@@ -5,7 +5,14 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { startBridge } from "../bridge/server.js";
 import { findBridgeObservation, findLiveBridge, type RuntimeState } from "../bridge/runtime.js";
-import { adminFetch, ensureBridge, stopBridge, verifyPublicConnectionOrStop } from "../process/daemon.js";
+import {
+  adminFetch,
+  ensureBridge,
+  startTunnelAndVerify,
+  stopBridge,
+  verifyPublicConnection,
+  verifyPublicConnectionOrStop,
+} from "../process/daemon.js";
 import { Workspace } from "../workspace/manager.js";
 import { AuthStore } from "../auth/store.js";
 import { detectTunnelBinaries } from "../tunnel/detect.js";
@@ -197,12 +204,6 @@ function inspectSandboxAllow(): {
   }
 }
 
-interface TunnelStartResponse {
-  url?: string;
-  error?: string;
-  message?: string;
-}
-
 interface PairingResponse {
   code: string;
   expiresAt: number;
@@ -225,13 +226,14 @@ async function ensureBridgeAndTunnel(
   workspaceRoot: string,
   opts: { tunnel: boolean }
 ): Promise<{ runtime: RuntimeState; info: AdminInfo; mcpUrl: string | null }> {
+  const workspace = new Workspace(workspaceRoot);
+  if (opts.tunnel && readTunnelState(workspace.id).preference === "unset") {
+    throw new Error("TUNNEL_CHOICE_REQUIRED");
+  }
   const { runtime } = await ensureBridge(workspaceRoot);
   let info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
   let mcpUrl: string | null = info.publicUrl ? `${info.publicUrl}/mcp` : null;
   let publicVerified = false;
-  if (opts.tunnel && readTunnelState(info.workspaceId).preference === "unset") {
-    throw new Error("TUNNEL_CHOICE_REQUIRED");
-  }
   if (opts.tunnel && (!info.publicUrl || !info.tunnel.running)) {
     const binaries = detectTunnelBinaries();
     if (!binaries.cloudflared) {
@@ -239,15 +241,10 @@ async function ensureBridgeAndTunnel(
         "NEED_CLOUDFLARED: cloudflared is not installed. Install it first (macOS: brew install cloudflared)."
       );
     }
-    const result = await adminFetch<TunnelStartResponse>(runtime, "POST", "/admin/tunnel/start", 90_000);
-    if (!result.url) {
-      await adminFetch(runtime, "POST", "/admin/tunnel/stop", 5000).catch(() => undefined);
-      throw new Error(result.message ?? "Tunnel start failed");
-    }
-    await verifyPublicConnectionOrStop(runtime, result.url, info.workspaceId);
+    const url = await startTunnelAndVerify(runtime, info.workspaceId);
     publicVerified = true;
     info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
-    mcpUrl = `${result.url}/mcp`;
+    mcpUrl = `${url}/mcp`;
   }
   if (opts.tunnel) {
     const publicUrl = info.publicUrl ?? info.tunnel.url;
@@ -464,7 +461,12 @@ program
           state: "unknown",
           workspace: { id: workspace.id, name: workspace.name },
           bridge: { healthy: null, pid: observation.runtime?.pid ?? null, port: observation.runtime?.port ?? null },
-          tunnel: { running: null, provider: configuredTunnel.provider ?? null, hostname: configuredTunnel.hostname ?? null },
+          tunnel: {
+            running: null,
+            verified: false,
+            provider: configuredTunnel.provider ?? null,
+            hostname: configuredTunnel.hostname ?? null,
+          },
           mcpUrl: null,
           reason: observation.reason,
         }));
@@ -481,7 +483,12 @@ program
           state: "stopped",
           workspace: { id: workspace.id, name: workspace.name },
           bridge: { healthy: false, pid: null, port: null },
-          tunnel: { running: false, provider: configuredTunnel.provider ?? null, hostname: configuredTunnel.hostname ?? null },
+          tunnel: {
+            running: false,
+            verified: false,
+            provider: configuredTunnel.provider ?? null,
+            hostname: configuredTunnel.hostname ?? null,
+          },
           mcpUrl: null,
         }));
       } else {
@@ -501,7 +508,7 @@ program
         state: "healthy",
         workspace: { id: info.workspaceId, name: info.workspaceName },
         bridge: { healthy: true, pid: info.pid, port: info.port },
-        tunnel: info.tunnel,
+        tunnel: { ...info.tunnel, verified: false },
         mcpUrl: info.tunnel.running && info.tunnel.url ? `${info.tunnel.url}/mcp` : null,
       }));
       return;
@@ -512,7 +519,8 @@ program
     check(`Bridge：healthy（端口 ${info.port}）`);
     say(`PID：${info.pid}`);
     if (info.tunnel.running && info.tunnel.url) {
-      check(`Tunnel：healthy（${info.tunnel.provider}）`);
+      check(`Tunnel：running（${info.tunnel.provider}）`);
+      say("MCP public verification：not checked");
       say(`MCP URL：${info.tunnel.url}/mcp`);
     } else {
       say("Tunnel：已停止");
@@ -639,10 +647,15 @@ program
       let healthy = false;
       if (currentUrl) {
         try {
-          const response = await fetch(`${currentUrl}/health`, { signal: AbortSignal.timeout(8000) });
-          healthy = response.ok;
-        } catch {
+          if (opts.fix) {
+            await verifyPublicConnectionOrStop(runtime, currentUrl, info.workspaceId);
+          } else {
+            await verifyPublicConnection(currentUrl, info.workspaceId);
+          }
+          healthy = true;
+        } catch (error) {
           healthy = false;
+          report.tunnel = { ok: false, detail: (error as Error).message };
         }
       }
 
@@ -652,16 +665,14 @@ program
           if (!binaries.cloudflared) {
             report.tunnel = { ok: false, detail: "NEED_CLOUDFLARED" };
           } else {
-            const started = await adminFetch<TunnelStartResponse>(runtime, "POST", "/admin/tunnel/start", 90_000);
-            if (started.url) {
-              const previousUrl = lastEndpoint?.publicUrl;
-              currentUrl = started.url;
-              healthy = true;
-              info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
-              const sameAddress =
-                previousUrl && normalizePublicUrl(previousUrl) === normalizePublicUrl(started.url);
-              results.push(sameAddress ? "已重新建立安全连接" : "已重新建立安全连接（地址已更换）");
-            }
+            const previousUrl = lastEndpoint?.publicUrl;
+            const startedUrl = await startTunnelAndVerify(runtime, info.workspaceId);
+            currentUrl = startedUrl;
+            healthy = true;
+            info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
+            const sameAddress =
+              previousUrl && normalizePublicUrl(previousUrl) === normalizePublicUrl(startedUrl);
+            results.push(sameAddress ? "已重新建立安全连接" : "已重新建立安全连接（地址已更换）");
           }
         } catch (error) {
           report.tunnel = { ok: false, detail: (error as Error).message };
@@ -733,6 +744,7 @@ program
 
     if (opts.json) {
       say(JSON.stringify({ report, repairs: results, chatgptRepair, namedRepair }));
+      if (Object.values(report).some((item) => !item.ok) || namedRepair.needed) process.exitCode = 1;
       return;
     }
     say(`${PRODUCT_NAME} Doctor`);

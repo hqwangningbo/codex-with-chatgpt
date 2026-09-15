@@ -57,6 +57,24 @@ describe("secure operational policy", () => {
     expect(cli).toContain('.option("--yes", "confirm the disclosed config.toml change", false)');
   });
 
+  it("routes doctor Tunnel repair through verified public checks", () => {
+    const cli = read("src/cli/index.ts");
+    const doctor = cli.split("// ---------------------------------------------------------------- doctor")[1]
+      .split("// ---------------------------------------------------------------- pair")[0];
+    expect(doctor).toContain("startTunnelAndVerify(runtime, info.workspaceId)");
+    expect(doctor).toContain("verifyPublicConnectionOrStop(runtime, currentUrl, info.workspaceId)");
+    expect(doctor).not.toMatch(/started\.url[\s\S]{0,120}healthy\s*=\s*true/);
+  });
+
+  it("does not describe an unverified local Tunnel process as healthy", () => {
+    const cli = read("src/cli/index.ts");
+    const status = cli.split("// ---------------------------------------------------------------- status")[1]
+      .split("// ---------------------------------------------------------------- doctor")[0];
+    expect(status).toContain("verified: false");
+    expect(status).toContain("Tunnel：running");
+    expect(status).not.toContain("Tunnel：healthy");
+  });
+
   it("contains no executable ChatGPT page automation or conversation state", () => {
     const runtimePolicy = [
       read("skill/SKILL.md"),

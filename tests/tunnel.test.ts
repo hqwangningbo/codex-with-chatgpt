@@ -44,6 +44,8 @@ class FakeCloudflaredProcess extends EventEmitter {
   killed = false;
   readonly kill = vi.fn(() => {
     this.killed = true;
+    this.exitCode = 0;
+    queueMicrotask(() => this.emit("exit", 0, null));
     return true;
   });
 }
