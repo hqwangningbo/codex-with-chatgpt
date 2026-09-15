@@ -57,6 +57,7 @@ export function ensureSandboxAllowlist(opts?: {
 }): SandboxAllowResult {
   const stateDir = path.resolve(opts?.stateDir ?? getStateDir());
   const configPath = opts?.configPath ?? getCodexConfigPath();
+  assertNarrowWritableRoot(stateDir);
   fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
   fs.mkdirSync(path.dirname(configPath), { recursive: true, mode: 0o700 });
 
@@ -73,6 +74,21 @@ export function ensureSandboxAllowlist(opts?: {
     // Windows / filesystems without chmod semantics
   }
   return { added: true, alreadyAllowed: false, stateDir, configPath };
+}
+
+export function assertNarrowWritableRoot(stateDir: string): void {
+  const resolved = path.resolve(stateDir);
+  const home = path.resolve(os.homedir());
+  const forbidden = [
+    path.parse(resolved).root,
+    home,
+    path.join(home, "Library"),
+    path.join(home, ".ssh"),
+    path.join(home, ".aws"),
+  ];
+  if (forbidden.some((candidate) => pathsEquivalent(resolved, candidate))) {
+    throw new Error(`Refusing broad or sensitive writable root: ${resolved}`);
+  }
 }
 
 export function upsertWritableRoot(content: string, stateDir: string): string {

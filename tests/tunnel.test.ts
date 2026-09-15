@@ -3,24 +3,31 @@ import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import type { ChildProcess } from "node:child_process";
 import { PassThrough } from "node:stream";
+import { tunnelForWorkspace } from "../src/bridge/server.js";
 import { findBinary } from "../src/tunnel/detect.js";
 import {
   CloudflaredQuickTunnel,
   parseQuickTunnelUrl,
   type CloudflaredQuickTunnelOptions,
 } from "../src/tunnel/cloudflared.js";
-import { normalizeNamedTunnelHostname } from "../src/tunnel/cloudflared-named.js";
+import { CloudflaredNamedTunnel, normalizeNamedTunnelHostname } from "../src/tunnel/cloudflared-named.js";
 import { hostnameSlug, parseZoneInput, suggestedNamedHostname } from "../src/tunnel/hostname.js";
 import {
   chooseQuickTunnel,
-  isBenignRouteError,
   parseCreatedTunnel,
   parseTunnelList,
   provisionNamedTunnel,
   type CloudflaredAccount,
 } from "../src/tunnel/named-provision.js";
 import { resolveTunnelProtocol, tunnelProtocolArgs } from "../src/tunnel/protocol.js";
-import { isNamedTunnelReady, needsTunnelChoice, readTunnelState } from "../src/tunnel/state.js";
+import {
+  isNamedTunnelReady,
+  needsTunnelChoice,
+  readTunnelState,
+  tunnelStateFile,
+  writeTunnelState,
+} from "../src/tunnel/state.js";
+import { isCloudflareDelegation } from "../src/tunnel/zone.js";
 import { cleanup, isolateStateDir, makeTmpDir, write } from "./helpers.js";
 
 const stateDirs: string[] = [];
@@ -251,6 +258,46 @@ describe("normalizeNamedTunnelHostname", () => {
   });
 });
 
+describe("CloudflaredNamedTunnel", () => {
+  it("restarts the saved tunnel with the same hostname", async () => {
+    const firstChild = new FakeCloudflaredProcess();
+    const secondChild = new FakeCloudflaredProcess();
+    const spawnImpl = vi.fn()
+      .mockReturnValueOnce(firstChild as unknown as ChildProcess)
+      .mockReturnValueOnce(secondChild as unknown as ChildProcess);
+    const tunnel = new CloudflaredNamedTunnel({
+      tunnelName: "c2c-abcdef123456",
+      hostname: "c2c-bifrost.example.com",
+      binaryOverride: "cloudflared",
+      spawnImpl,
+      startTimeoutMs: 1000,
+    });
+
+    const firstStart = tunnel.start(48765);
+    firstChild.stderr.write("INF Registered tunnel connection\n");
+    await expect(firstStart).resolves.toBe("https://c2c-bifrost.example.com");
+    await tunnel.stop();
+
+    const secondStart = tunnel.start(48766);
+    secondChild.stderr.write("INF Registered tunnel connection\n");
+    await expect(secondStart).resolves.toBe("https://c2c-bifrost.example.com");
+    expect(spawnImpl).toHaveBeenNthCalledWith(
+      2,
+      "cloudflared",
+      [
+        "tunnel",
+        "--no-autoupdate",
+        "--url",
+        "http://127.0.0.1:48766",
+        "run",
+        "c2c-abcdef123456",
+      ],
+      { stdio: ["ignore", "pipe", "pipe"], windowsHide: true }
+    );
+    await tunnel.stop();
+  });
+});
+
 describe("named hostname helpers", () => {
   it("builds a stable c2c-<project>.<zone> hostname", () => {
     expect(suggestedNamedHostname("Example.COM", "My App", "abcdef123456")).toBe("c2c-my-app.example.com");
@@ -263,6 +310,14 @@ describe("named hostname helpers", () => {
   it("parses a typed domain", () => {
     expect(parseZoneInput("https://Example.com/")).toBe("example.com");
     expect(parseZoneInput("not a domain")).toBeNull();
+  });
+});
+
+describe("Cloudflare Zone checks", () => {
+  it("requires at least two Cloudflare authoritative nameservers", () => {
+    expect(isCloudflareDelegation(["ada.ns.cloudflare.com", "bob.ns.cloudflare.com."])).toBe(true);
+    expect(isCloudflareDelegation(["ns1.aliyun.com", "ns2.aliyun.com"])).toBe(false);
+    expect(isCloudflareDelegation(["ada.ns.cloudflare.com"])).toBe(false);
   });
 });
 
@@ -286,9 +341,6 @@ ID                                   NAME          CREATED
     ).toEqual({ id: "22222222-2222-2222-2222-222222222222", name: "c2c-abc" });
   });
 
-  it("treats an existing DNS route as success", () => {
-    expect(isBenignRouteError("Failed to add route: record already exists")).toBe(true);
-  });
 });
 
 describe("tunnel preference state", () => {
@@ -300,6 +352,23 @@ describe("tunnel preference state", () => {
     expect(saved.preference).toBe("quick");
     expect(needsTunnelChoice(readTunnelState("ws1"))).toBe(false);
     expect(isNamedTunnelReady(saved)).toBe(false);
+  });
+
+  it("selects the saved Named provider after a Bridge restart", () => {
+    stateDirs.push(isolateStateDir());
+    writeTunnelState({
+      workspaceId: "persisted-workspace",
+      preference: "named",
+      provider: "cloudflare-named",
+      tunnelName: "c2c-persisted-workspace",
+      tunnelId: "77777777-7777-7777-7777-777777777777",
+      hostname: "c2c-persisted.example.com",
+    });
+    expect(tunnelForWorkspace("persisted-workspace").status()).toMatchObject({
+      provider: "cloudflare-named",
+      running: false,
+      url: null,
+    });
   });
 
   it("provisions a named hostname through the account adapter and stores it outside the project", () => {
@@ -322,10 +391,13 @@ describe("tunnel preference state", () => {
       expect(result.state.hostname).toBe("c2c-demo.example.com");
       expect(result.state.tunnelName).toBe("c2c-abcdef123456");
       expect(isNamedTunnelReady(readTunnelState("abcdef123456"))).toBe(true);
+      if (process.platform !== "win32") {
+        expect(fs.statSync(tunnelStateFile("abcdef123456")).mode & 0o777).toBe(0o600);
+      }
     });
   });
 
-  it("falls back to a temporary address when named provisioning fails", () => {
+  it("fails closed without switching to a temporary address when named provisioning fails", () => {
     stateDirs.push(isolateStateDir());
     const account: CloudflaredAccount = {
       hasCert: () => true,
@@ -342,9 +414,114 @@ describe("tunnel preference state", () => {
       zone: "example.com",
       account,
     }).then((result) => {
-      expect(result.fallback).toBe(true);
-      expect(result.state.preference).toBe("quick");
-      expect(result.userMessage).toMatch(/临时地址/);
+      expect(result.ok).toBe(false);
+      expect(result.fallback).toBe(false);
+      expect(result.state.preference).toBe("unset");
+      expect(result.userMessage).toMatch(/未自动切换/);
     });
+  });
+
+  it("treats an existing unverified DNS record as a conflict, not success", async () => {
+    stateDirs.push(isolateStateDir());
+    const account: CloudflaredAccount = {
+      hasCert: () => true,
+      login: async () => undefined,
+      listTunnels: async () => [],
+      createTunnel: async (name) => ({ id: "66666666-6666-6666-6666-666666666666", name }),
+      routeDns: async () => {
+        throw new Error("Failed to add route: record already exists");
+      },
+    };
+    const result = await provisionNamedTunnel({
+      workspaceId: "dns-conflict",
+      workspaceName: "Bifrost",
+      zone: "example.com",
+      account,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/already exists/);
+    expect(readTunnelState("dns-conflict").preference).toBe("unset");
+  });
+
+  it("reuses the saved tunnel and hostname without routing DNS again", async () => {
+    stateDirs.push(isolateStateDir());
+    const routeDns = vi.fn(async () => undefined);
+    const tunnel = { id: "44444444-4444-4444-4444-444444444444", name: "c2c-abcdef123456" };
+    const account: CloudflaredAccount = {
+      hasCert: () => true,
+      login: async () => undefined,
+      listTunnels: async () => [tunnel],
+      createTunnel: async () => tunnel,
+      routeDns,
+    };
+    const first = await provisionNamedTunnel({
+      workspaceId: "abcdef123456",
+      workspaceName: "Bifrost",
+      zone: "example.com",
+      account,
+    });
+    const second = await provisionNamedTunnel({
+      workspaceId: "abcdef123456",
+      workspaceName: "Bifrost",
+      zone: "example.com",
+      account,
+    });
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+    expect(second.state.hostname).toBe("c2c-bifrost.example.com");
+    expect(routeDns).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not let another workspace silently claim a saved hostname", async () => {
+    stateDirs.push(isolateStateDir());
+    const account: CloudflaredAccount = {
+      hasCert: () => true,
+      login: async () => undefined,
+      listTunnels: async () => [],
+      createTunnel: async (name) => ({ id: "55555555-5555-5555-5555-555555555555", name }),
+      routeDns: async () => undefined,
+    };
+    await provisionNamedTunnel({
+      workspaceId: "workspace-one",
+      workspaceName: "One",
+      zone: "example.com",
+      hostname: "c2c-shared.example.com",
+      account,
+    });
+    const second = await provisionNamedTunnel({
+      workspaceId: "workspace-two",
+      workspaceName: "Two",
+      zone: "example.com",
+      hostname: "c2c-shared.example.com",
+      account,
+    });
+    expect(second.ok).toBe(false);
+    expect(second.error).toMatch(/already bound to workspace workspace-one/);
+    expect(second.state.preference).toBe("unset");
+  });
+
+  it("allows different workspaces to keep different stable hostnames", async () => {
+    stateDirs.push(isolateStateDir());
+    const account: CloudflaredAccount = {
+      hasCert: () => true,
+      login: async () => undefined,
+      listTunnels: async () => [],
+      createTunnel: async (name) => ({ id: `${name}-id`, name }),
+      routeDns: async () => undefined,
+    };
+    const one = await provisionNamedTunnel({
+      workspaceId: "workspace-one",
+      workspaceName: "Bifrost",
+      zone: "example.com",
+      account,
+    });
+    const two = await provisionNamedTunnel({
+      workspaceId: "workspace-two",
+      workspaceName: "Vault",
+      zone: "example.com",
+      account,
+    });
+    expect(one.state.hostname).toBe("c2c-bifrost.example.com");
+    expect(two.state.hostname).toBe("c2c-vault.example.com");
   });
 });

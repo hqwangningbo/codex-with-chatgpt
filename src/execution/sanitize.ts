@@ -1,4 +1,5 @@
 import { redact } from "../logger/index.js";
+import { sanitizeWorkspaceText } from "../workspace/sanitize.js";
 
 export const MAX_OUTPUT_BYTES = 64 * 1024;
 export const MAX_OUTPUT_LINES = 200;
@@ -16,6 +17,7 @@ const EXTRA_REDACT: RegExp[] = [
   /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g,
   /\bAKIA[0-9A-Z]{16}\b/g,
   /\bAIza[0-9A-Za-z_-]{20,}\b/g,
+  /((?:PRIVATE_KEY|MNEMONIC|SEED_PHRASE|WALLET_PRIVATE_KEY|DEPLOYER_PRIVATE_KEY)\s*[:=]\s*)[^\r\n]+/gi,
   /((?:api[_-]?key|secret|password|passwd|authorization)\s*[:=]\s*)\S+/gi,
 ];
 
@@ -67,6 +69,9 @@ export function sanitizeExecutionOutput(raw: string): SanitizeResult {
   let text = redact(raw);
   text = applyExtraRedact(text);
   text = redactHomePaths(text);
+  const workspaceGate = sanitizeWorkspaceText(text);
+  if (!workspaceGate.allowed) return { allowed: false, reason: "private_key" };
+  text = workspaceGate.text;
   const { text: limited, truncated } = truncate(text);
   return { allowed: true, text: limited, truncated };
 }

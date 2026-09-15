@@ -14,6 +14,8 @@ beforeAll(() => {
   write(root, "src/root.ts", `${globMarker}\n`);
   write(root, "root.ts", `${globMarker}\n`);
   write(root, "README.md", "This project contains needle-alpha documentation.\n");
+  write(root, "safe-token.txt", "github_pat_abcdefghijklmnopqrstuvwxyz123456\n");
+  write(root, "safe-key.txt", "-----BEGIN OPENSSH PRIVATE KEY-----\n");
   write(root, ".env", "NEEDLE-ALPHA=secret\n");
   write(root, "node_modules/pkg/index.js", "needle-alpha in dependencies\n");
   for (let i = 0; i < 30; i++) {
@@ -89,5 +91,15 @@ describe.each(engines())("search engine: %s", (engine) => {
     const paths = result.matches.map((match) => match.path);
     expect(paths).toContain("src/auth.ts");
     expect(paths).not.toContain("README.md");
+  });
+
+  it("redacts token-shaped matches and rejects private-key material", async () => {
+    configure();
+    const tokenResult = await searchWorkspace(ws, { query: "github_pat_" });
+    expect(tokenResult.matches[0]?.text).toContain("[REDACTED]");
+    expect(tokenResult.matches[0]?.text).not.toContain("abcdefghijklmnopqrstuvwxyz");
+    await expect(searchWorkspace(ws, { query: "BEGIN OPENSSH" })).rejects.toMatchObject({
+      code: "ACCESS_DENIED_SENSITIVE_FILE",
+    });
   });
 });

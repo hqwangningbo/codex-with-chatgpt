@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -113,6 +114,31 @@ describe("c2c record", () => {
       expect(result.status).toBe(1);
       expect(readExecutionRecords(workspace.id)).toEqual([]);
       expect(listExecutionOutputs(workspace.id)).toEqual([]);
+    });
+  });
+
+  it("rejects output files outside the workspace boundary", () => {
+    withRecordEnvironment((root, workspace) => {
+      const outside = makeTmpDir("record-cli-outside");
+      const outputFile = path.join(outside, "test.log");
+      fs.writeFileSync(outputFile, "must not be recorded");
+      try {
+        const result = runRecord(root, [
+          "--iteration",
+          "1",
+          "--command",
+          "forge test",
+          "--output-file",
+          outputFile,
+        ]);
+
+        expect(result.status).toBe(1);
+        expect(result.stdout).toContain("outside the connected workspace");
+        expect(readExecutionRecords(workspace.id)).toEqual([]);
+        expect(listExecutionOutputs(workspace.id)).toEqual([]);
+      } finally {
+        cleanup(outside);
+      }
     });
   });
 });

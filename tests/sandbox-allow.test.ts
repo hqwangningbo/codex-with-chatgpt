@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import {
+  assertNarrowWritableRoot,
   ensureSandboxAllowlist,
   isStateDirAllowlisted,
   pathsEquivalent,
@@ -11,6 +12,12 @@ import {
 import { makeTmpDir, cleanup } from "./helpers.js";
 
 describe("sandbox allowlist", () => {
+  it("rejects broad or credential-bearing writable roots", () => {
+    expect(() => assertNarrowWritableRoot(path.parse(process.cwd()).root)).toThrow(/Refusing/);
+    expect(() => assertNarrowWritableRoot(path.join(process.env.HOME ?? "", ".ssh"))).toThrow(/Refusing/);
+    expect(() => assertNarrowWritableRoot(path.join(process.env.HOME ?? "", ".aws"))).toThrow(/Refusing/);
+  });
+
   it("treats Windows slash variants as the same path", () => {
     expect(pathsEquivalent("C:\\Users\\Ada\\AppData\\Local\\codex-with-chatgpt", "C:/Users/Ada/AppData/Local/codex-with-chatgpt")).toBe(
       true

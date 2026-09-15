@@ -65,7 +65,7 @@ export interface CloudflaredQuickTunnelOptions {
 /**
  * Cloudflare Quick Tunnel provider.
  * Quick Tunnels need no account/login; the URL changes on every start,
- * which the bridge and the Skill handle by reconfiguring automatically.
+ * so the user must manually update the Connector when explicitly using one.
  */
 export class CloudflaredQuickTunnel implements TunnelProvider {
   readonly name = "cloudflare-quick";

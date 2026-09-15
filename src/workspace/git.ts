@@ -1,5 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { IgnoreRules } from "./ignore.js";
+import { WorkspaceError } from "./manager.js";
+import { sanitizeWorkspaceText } from "./sanitize.js";
 
 export interface GitCommandResult {
   ok: boolean;
@@ -226,14 +228,24 @@ export function gitDiff(
     };
   }
 
+  const prefixResult = runGit(root, ["rev-parse", "--show-prefix"]);
+  const repoPrefix = prefixResult.ok ? prefixResult.stdout.trim().replace(/\/+$/, "") : "";
+  const workspacePath = (filePath: string): string | null => {
+    if (!repoPrefix) return filePath;
+    const prefix = `${repoPrefix}/`;
+    return filePath.startsWith(prefix) ? filePath.slice(prefix.length) : null;
+  };
+
   const tokens = listResult.stdout.split("\0");
   const safePaths: string[] = [];
   for (let i = 0; i < tokens.length; ) {
     const status = tokens[i++];
     if (!status) break;
     if (status.startsWith("R") || status.startsWith("C")) {
-      const oldPath = tokens[i++];
-      const newPath = tokens[i++];
+      const oldRaw = tokens[i++];
+      const newRaw = tokens[i++];
+      const oldPath = oldRaw ? workspacePath(oldRaw) : null;
+      const newPath = newRaw ? workspacePath(newRaw) : null;
       if (oldPath && newPath) {
         // Layer 1: Security - EITHER side sensitive -> completely unsafe
         const isSafe = !ignoreRules.isSensitive(oldPath) && !ignoreRules.isSensitive(newPath);
@@ -244,7 +256,8 @@ export function gitDiff(
         }
       }
     } else {
-      const filePath = tokens[i++];
+      const rawPath = tokens[i++];
+      const filePath = rawPath ? workspacePath(rawPath) : null;
       if (filePath) {
         const isSafe = !ignoreRules.isSensitive(filePath);
         const isRelevant = isPathInScope(filePath, relPath);
@@ -318,7 +331,14 @@ export function gitDiff(
     }
   }
 
-  const full = Buffer.from(combinedDiff, "utf8");
+  const sanitized = sanitizeWorkspaceText(combinedDiff);
+  if (!sanitized.allowed) {
+    throw new WorkspaceError(
+      "ACCESS_DENIED_SENSITIVE_FILE",
+      "Git diff contains private key material and cannot be returned."
+    );
+  }
+  const full = Buffer.from(sanitized.text, "utf8");
   const slice = full.subarray(offset, offset + maxBytes);
   let text = slice.toString("utf8");
   let sliceLen = slice.length;

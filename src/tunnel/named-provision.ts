@@ -6,7 +6,9 @@ import { findBinary } from "./detect.js";
 import { suggestedNamedHostname } from "./hostname.js";
 import { normalizeNamedTunnelHostname } from "./cloudflared-named.js";
 import {
-  NAMED_FALLBACK_MESSAGE,
+  findHostnameOwner,
+  isNamedTunnelReady,
+  readTunnelState,
   writeTunnelState,
   type TunnelState,
 } from "./state.js";
@@ -73,10 +75,6 @@ export function parseTunnelList(output: string): ListedTunnel[] {
 export function parseCreatedTunnel(output: string, name: string): ListedTunnel | null {
   const id = output.match(TUNNEL_ID_RE)?.[0];
   return id ? { id, name } : null;
-}
-
-export function isBenignRouteError(message: string): boolean {
-  return /already exists|duplicate|exists as a cname/i.test(message);
 }
 
 export class ProcessCloudflaredAccount implements CloudflaredAccount {
@@ -158,7 +156,7 @@ export class ProcessCloudflaredAccount implements CloudflaredAccount {
 
   async routeDns(tunnelName: string, hostname: string): Promise<void> {
     const result = this.run(["tunnel", "route", "dns", tunnelName, hostname]);
-    if (result.ok || isBenignRouteError(`${result.stdout}\n${result.stderr}`)) return;
+    if (result.ok) return;
     throw new Error(result.stderr || result.stdout || `Unable to route ${hostname}`);
   }
 
@@ -198,12 +196,32 @@ export async function provisionNamedTunnel(opts: {
       ? normalizeNamedTunnelHostname(opts.hostname)
       : suggestedNamedHostname(opts.zone, opts.workspaceName, opts.workspaceId);
   } catch (error) {
-    return fallbackState(opts.workspaceId, "invalid_hostname", (error as Error).message);
+    return failedState(opts.workspaceId, (error as Error).message);
   }
 
   const tunnelName = `c2c-${opts.workspaceId}`;
   try {
+    const owner = findHostnameOwner(hostname, opts.workspaceId);
+    if (owner) {
+      return failedState(
+        opts.workspaceId,
+        `Hostname ${hostname} is already bound to workspace ${owner.workspaceId}; refusing to remap it`
+      );
+    }
     if (!account.hasCert()) await account.login();
+    const current = readTunnelState(opts.workspaceId);
+    if (
+      isNamedTunnelReady(current) &&
+      current.hostname === hostname &&
+      current.tunnelName === tunnelName &&
+      current.tunnelId
+    ) {
+      const existing = (await account.listTunnels()).find(
+        (tunnel) => tunnel.id === current.tunnelId && tunnel.name === current.tunnelName
+      );
+      if (existing) return { ok: true, state: current, fallback: false };
+      return failedState(opts.workspaceId, `Saved named tunnel ${current.tunnelId} no longer exists`);
+    }
     const tunnel = await account.createTunnel(tunnelName);
     await account.routeDns(tunnel.name, hostname);
     const state = writeTunnelState({
@@ -219,7 +237,7 @@ export async function provisionNamedTunnel(opts: {
     });
     return { ok: true, state, fallback: false };
   } catch (error) {
-    return fallbackState(opts.workspaceId, "provision_failed", (error as Error).message);
+    return failedState(opts.workspaceId, (error as Error).message);
   }
 }
 
@@ -233,13 +251,12 @@ export function chooseQuickTunnel(workspaceId: string, fallbackReason?: string):
   });
 }
 
-function fallbackState(workspaceId: string, reason: string, error: string): ProvisionNamedResult {
-  const state = chooseQuickTunnel(workspaceId, reason);
+function failedState(workspaceId: string, error: string): ProvisionNamedResult {
   return {
-    ok: true,
-    state,
-    fallback: true,
-    userMessage: NAMED_FALLBACK_MESSAGE,
+    ok: false,
+    state: readTunnelState(workspaceId),
+    fallback: false,
+    userMessage: "固定域名配置失败，未自动切换到临时 Tunnel。",
     error,
   };
 }

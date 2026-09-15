@@ -135,6 +135,37 @@ describe("gitDiff pagination", () => {
     expect(diff.isRepo).toBe(false);
   });
 
+  it("does not expose parent changes when the workspace is a monorepo subdirectory", () => {
+    const monorepo = makeTmpDir("monorepo");
+    makeGitRepo(monorepo);
+    write(monorepo, "packages/app/app.ts", "export const app = 1;\n");
+    git(monorepo, "add", "packages/app/app.ts");
+    git(monorepo, "commit", "-m", "add nested app");
+    write(monorepo, "hello.txt", "parent-only-change\n");
+    write(monorepo, "packages/app/app.ts", "export const app = 2;\n");
+
+    const diff = gitDiff(path.join(monorepo, "packages/app"), { mode: "unstaged" });
+    expect(diff.diff).toContain("app = 2");
+    expect(diff.diff).not.toContain("parent-only-change");
+    cleanup(monorepo);
+  });
+
+  it("redacts contextual Web3 keys and rejects private-key blocks", () => {
+    const key = `0x${"b".repeat(64)}`;
+    write(repo, "src/web3.ts", "export const value = 'safe';\n");
+    git(repo, "add", "src/web3.ts");
+    git(repo, "commit", "-m", "add web3 fixture");
+
+    write(repo, "src/web3.ts", `export const private_key = "${key}";\n`);
+    const redacted = gitDiff(repo, { mode: "unstaged" });
+    expect(redacted.diff).toContain("[REDACTED]");
+    expect(redacted.diff).not.toContain(key);
+
+    write(repo, "src/web3.ts", "-----BEGIN PRIVATE KEY-----\nabc\n");
+    expect(() => gitDiff(repo, { mode: "unstaged" })).toThrow(/private key material/i);
+    git(repo, "checkout", "--", "src/web3.ts");
+  });
+
   it("excludes all IgnoreRules sensitive patterns across unstaged, staged, and head modes", () => {
     const sensitiveFiles = [
       { path: ".env", content: "SECRET_KEY=leaked-env\n", sentinel: "leaked-env" },

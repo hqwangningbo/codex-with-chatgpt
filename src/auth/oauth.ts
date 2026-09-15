@@ -222,6 +222,10 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
       return;
     }
     const scopes = filterScopes(query.scope);
+    if (query.scope?.trim() && scopes.length === 0) {
+      fail("invalid_scope", "No supported OAuth scope was requested");
+      return;
+    }
     const request: PendingAuthRequest = {
       id: randomBytes(16).toString("hex"),
       clientId: client.clientId,

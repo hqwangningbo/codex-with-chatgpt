@@ -17,7 +17,7 @@ import { DEFAULT_HOST, DEFAULT_PORT } from "../config/paths.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
 import { writeRuntimeState, clearRuntimeState, type RuntimeState } from "./runtime.js";
 
-function tunnelForWorkspace(workspaceId: string, logger: Logger): TunnelProvider {
+export function tunnelForWorkspace(workspaceId: string, logger: Logger = nullLogger): TunnelProvider {
   const binding = namedTunnelBinding(readTunnelState(workspaceId));
   if (binding) {
     return new CloudflaredNamedTunnel({

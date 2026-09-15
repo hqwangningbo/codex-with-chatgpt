@@ -36,6 +36,31 @@ describe("sanitizeExecutionOutput", () => {
     }
   });
 
+  it("redacts common Web3 secret assignments", () => {
+    const key = `0x${"c".repeat(64)}`;
+    const result = sanitizeExecutionOutput(
+      `PRIVATE_KEY=${key}\nMNEMONIC=alpha beta gamma\nSEED_PHRASE=one two three\nWALLET_PRIVATE_KEY=${key}\nDEPLOYER_PRIVATE_KEY=${key}`
+    );
+    expect(result.allowed).toBe(true);
+    if (result.allowed) {
+      expect(result.text).not.toContain(key);
+      expect(result.text).not.toContain("alpha beta gamma");
+      expect(result.text).not.toContain("one two three");
+      expect(result.text.match(/\[REDACTED\]/g)?.length).toBeGreaterThanOrEqual(5);
+    }
+  });
+
+  it("redacts contextual Web3 keys without hiding ordinary transaction hashes", () => {
+    const key = `0x${"d".repeat(64)}`;
+    const contextual = sanitizeExecutionOutput(`using deployer signer\naddress key: ${key}`);
+    expect(contextual.allowed).toBe(true);
+    if (contextual.allowed) expect(contextual.text).not.toContain(key);
+
+    const ordinary = sanitizeExecutionOutput(`transaction hash: ${key}`);
+    expect(ordinary.allowed).toBe(true);
+    if (ordinary.allowed) expect(ordinary.text).toContain(key);
+  });
+
   it("truncates giant logs", () => {
     const raw = Array.from({ length: MAX_OUTPUT_LINES + 50 }, (_, i) => `line ${i}`).join("\n");
     const result = sanitizeExecutionOutput(raw);

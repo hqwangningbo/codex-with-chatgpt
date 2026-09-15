@@ -51,4 +51,35 @@ describe("port collision handling", () => {
     ).rejects.toThrow(/loopback/);
     cleanup(root);
   });
+
+  it("keeps the admin API loopback-only, token-protected, and proxy-proof", async () => {
+    const root = makeTmpDir("admin-guard");
+    write(root, "a.txt", "a");
+    const bridge = await startBridge({
+      workspaceRoot: root,
+      port: 0,
+      persistRuntime: false,
+      authStoreFile: path.join(makeTmpDir("auth"), "admin.json"),
+    });
+    try {
+      const url = `${bridge.localBaseUrl()}/admin/info`;
+      expect((await fetch(url)).status).toBe(404);
+      expect(
+        (
+          await fetch(url, {
+            headers: {
+              authorization: `Bearer ${bridge.adminToken}`,
+              "cf-connecting-ip": "203.0.113.10",
+            },
+          })
+        ).status
+      ).toBe(404);
+      expect(
+        (await fetch(url, { headers: { authorization: `Bearer ${bridge.adminToken}` } })).status
+      ).toBe(200);
+    } finally {
+      await bridge.close();
+      cleanup(root);
+    }
+  });
 });

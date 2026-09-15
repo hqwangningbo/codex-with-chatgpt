@@ -19,8 +19,8 @@ describe("connectorAction", () => {
 
   it("updates when the old address was reclaimed", () => {
     expect(connectorAction("https://old.trycloudflare.com/mcp", "https://new.trycloudflare.com/mcp")).toBe("update");
-    expect(reclaimUserMessage("Codex with ChatGPT")).toContain("删除");
-    expect(reclaimUserMessage("Codex with ChatGPT")).not.toContain("Reconnect");
+    expect(reclaimUserMessage("Codex with ChatGPT")).toContain("手动更新");
+    expect(reclaimUserMessage("Codex with ChatGPT")).toContain("不会操作");
   });
 
   it("does nothing without a next URL", () => {
@@ -37,7 +37,7 @@ describe("connectorNameFor", () => {
         previousName: "Codex with ChatGPT",
         hadEndpointBefore: true,
       })
-    ).toBe(DEFAULT_CONNECTOR_NAME);
+    ).toBe("Codex with ChatGPT");
   });
 
   it("keeps the legacy title when this workspace was used before the name field existed", () => {
@@ -47,7 +47,7 @@ describe("connectorNameFor", () => {
         workspaceId: "abc123abc123",
         hadEndpointBefore: true,
       })
-    ).toBe(DEFAULT_CONNECTOR_NAME);
+    ).toBe("Codex with ChatGPT");
   });
 
   it("gives a new workspace its own connector title", () => {
@@ -57,7 +57,7 @@ describe("connectorNameFor", () => {
         workspaceId: "def456def456",
         hadEndpointBefore: false,
       })
-    ).toBe("Codex with ChatGPT · Landing");
+    ).toBe(`${DEFAULT_CONNECTOR_NAME} · Landing`);
   });
 });
 

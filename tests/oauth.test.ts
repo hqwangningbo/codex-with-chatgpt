@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import fs from "node:fs";
 import path from "node:path";
 import { startBridge, type Bridge } from "../src/bridge/server.js";
 import { makeTmpDir, cleanup, write, isolateStateDir, pkceVerifierAndChallenge } from "./helpers.js";
@@ -6,6 +7,7 @@ import { makeTmpDir, cleanup, write, isolateStateDir, pkceVerifierAndChallenge }
 let root: string;
 let bridge: Bridge;
 let base: string;
+let authFile: string;
 
 const REDIRECT_URI = "http://127.0.0.1:19999/callback";
 
@@ -13,11 +15,12 @@ beforeAll(async () => {
   isolateStateDir();
   root = makeTmpDir("oauth-ws");
   write(root, "hello.txt", "hello oauth\n");
+  authFile = path.join(makeTmpDir("auth"), "store.json");
   bridge = await startBridge({
     workspaceRoot: root,
     port: 0,
     persistRuntime: false,
-    authStoreFile: path.join(makeTmpDir("auth"), "store.json"),
+    authStoreFile: authFile,
   });
   base = bridge.localBaseUrl();
 });
@@ -123,6 +126,14 @@ describe("authorization + token flow", () => {
     expect(token.body.access_token).toMatch(/^c2c_at_/);
     expect(token.body.refresh_token).toMatch(/^c2c_rt_/);
     expect(token.body.token_type).toBe("Bearer");
+    const persisted = fs.readFileSync(authFile, "utf8");
+    expect(persisted).not.toContain(token.body.access_token);
+    expect(persisted).not.toContain(token.body.refresh_token);
+    expect(persisted).toMatch(/"hash":\s*"[a-f0-9]{64}"/);
+    if (process.platform !== "win32") {
+      expect(fs.statSync(authFile).mode & 0o777).toBe(0o600);
+      expect(fs.statSync(path.dirname(authFile)).mode & 0o777).toBe(0o700);
+    }
 
     // authorized MCP request
     const mcpResponse = await fetch(`${base}/mcp`, {
@@ -243,6 +254,22 @@ describe("authorization + token flow", () => {
     const response = await fetch(authorizeUrl, { redirect: "manual" });
     expect(response.status).toBe(302);
     expect(response.headers.get("location")).toContain("error=invalid_request");
+  });
+
+  it("fails closed when every explicitly requested scope is unsupported", async () => {
+    const clientId = await registerClient();
+    const { challenge } = pkceVerifierAndChallenge();
+    const authorizeUrl = new URL(`${base}/oauth/authorize`);
+    authorizeUrl.searchParams.set("client_id", clientId);
+    authorizeUrl.searchParams.set("redirect_uri", REDIRECT_URI);
+    authorizeUrl.searchParams.set("response_type", "code");
+    authorizeUrl.searchParams.set("code_challenge", challenge);
+    authorizeUrl.searchParams.set("code_challenge_method", "S256");
+    authorizeUrl.searchParams.set("scope", "workspace.write shell");
+
+    const response = await fetch(authorizeUrl, { redirect: "manual" });
+    expect(response.status).toBe(302);
+    expect(new URL(response.headers.get("location")!).searchParams.get("error")).toBe("invalid_scope");
   });
 
   it("rejects registration with non-https redirect uris", async () => {

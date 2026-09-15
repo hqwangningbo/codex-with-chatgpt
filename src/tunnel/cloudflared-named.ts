@@ -15,6 +15,7 @@ export interface CloudflaredNamedTunnelOptions {
   logger?: Logger;
   binaryOverride?: string;
   startTimeoutMs?: number;
+  spawnImpl?: typeof spawn;
 }
 
 export function normalizeNamedTunnelHostname(hostname: string): string {
@@ -39,6 +40,7 @@ export class CloudflaredNamedTunnel implements TunnelProvider {
   private readonly logger: Logger;
   private readonly binaryOverride?: string;
   private readonly startTimeoutMs: number;
+  private readonly spawnImpl: typeof spawn;
   private child: ChildProcess | null = null;
   private connected = false;
   private lastError: string | null = null;
@@ -53,6 +55,7 @@ export class CloudflaredNamedTunnel implements TunnelProvider {
     this.logger = opts.logger ?? nullLogger;
     this.binaryOverride = opts.binaryOverride;
     this.startTimeoutMs = opts.startTimeoutMs ?? 45_000;
+    this.spawnImpl = opts.spawnImpl ?? spawn;
   }
 
   private binary(): string | null {
@@ -73,7 +76,7 @@ export class CloudflaredNamedTunnel implements TunnelProvider {
     }
 
     return new Promise<string>((resolve, reject) => {
-      const child = spawn(
+      const child = this.spawnImpl(
         bin,
         [
           "tunnel",

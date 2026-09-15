@@ -2,7 +2,8 @@ import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
-import { Workspace } from "./manager.js";
+import { Workspace, WorkspaceError } from "./manager.js";
+import { sanitizeWorkspaceText } from "./sanitize.js";
 
 export interface SearchOptions {
   query: string;
@@ -84,6 +85,7 @@ async function searchWithRipgrep(
     const child = spawn(rgBin, args, { cwd: ws.root, windowsHide: true });
     const matches: SearchMatch[] = [];
     let truncated = false;
+    let secretDetected = false;
     const rl = readline.createInterface({ input: child.stdout });
     rl.on("line", (line) => {
       if (matches.length >= limit) {
@@ -99,10 +101,16 @@ async function searchWithRipgrep(
         if (event.type !== "match" || !event.data?.path?.text) return;
         const rel = path.relative(ws.root, event.data.path.text).split(path.sep).join("/");
         if (rel.startsWith("..") || ws.ignoreRules.isHidden(rel)) return;
+        const sanitized = sanitizeWorkspaceText((event.data.lines?.text ?? "").trimEnd().slice(0, 500));
+        if (!sanitized.allowed) {
+          secretDetected = true;
+          child.kill("SIGTERM");
+          return;
+        }
         matches.push({
           path: rel,
           line: event.data.line_number ?? 0,
-          text: (event.data.lines?.text ?? "").trimEnd().slice(0, 500),
+          text: sanitized.text,
         });
       } catch {
         // ignore malformed json lines
@@ -110,6 +118,10 @@ async function searchWithRipgrep(
     });
     child.on("error", reject);
     child.on("close", () => {
+      if (secretDetected) {
+        reject(new WorkspaceError("ACCESS_DENIED_SENSITIVE_FILE", "Search result contains private key material."));
+        return;
+      }
       resolvePromise({ matches, matchCount: matches.length, truncated, engine: "ripgrep" });
     });
   });
@@ -163,7 +175,11 @@ async function searchWithNode(
           const line = lines[i];
           const hit = matcher ? matcher.test(line) : line.toLowerCase().includes(needle);
           if (hit) {
-            matches.push({ path: childRel, line: i + 1, text: line.trimEnd().slice(0, 500) });
+            const sanitized = sanitizeWorkspaceText(line.trimEnd().slice(0, 500));
+            if (!sanitized.allowed) {
+              throw new WorkspaceError("ACCESS_DENIED_SENSITIVE_FILE", "Search result contains private key material.");
+            }
+            matches.push({ path: childRel, line: i + 1, text: sanitized.text });
             if (matches.length >= limit) {
               truncated = true;
               return;

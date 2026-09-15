@@ -1,0 +1,30 @@
+# Wallet / private keys
+wallet/
+wallets/
+keystore/
+keystores/
+mnemonic*
+seed*
+private-key*
+private_key*
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Deployment secrets
+deploy-secrets/
+production-secrets/
+prod-secrets/
+secrets/
+
+# Infrastructure credentials
+.cloudflare/
+.aws/
+.ssh/
+
+# Optional production configuration
+config/production.local.*
+deployments/private/
+ops/private/

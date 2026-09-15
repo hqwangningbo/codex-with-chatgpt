@@ -90,9 +90,12 @@ describe("MCP tools over Streamable HTTP", () => {
       "test_status",
       "workspace_info",
     ]);
-    // no write tools in V1
-    for (const forbidden of ["write_file", "delete_file", "execute_shell", "git_commit", "install_package"]) {
-      expect(names).not.toContain(forbidden);
+    // Fail CI if any public capability looks like filesystem mutation,
+    // command execution, package installation, or a Git write operation.
+    const forbiddenCapabilities =
+      /(?:^|_)(?:write|delete|remove|move|rename|shell|exec|terminal|run_command|install|commit|push|checkout|merge|rebase|reset|stash|clean)(?:_|$)/i;
+    for (const name of names) {
+      expect(name, `dangerous public MCP tool: ${name}`).not.toMatch(forbiddenCapabilities);
     }
 
     expectToolOutputSchema(tools, "workspace_info", ["workspaceId", "workspaceName", "projectType", "git"]);

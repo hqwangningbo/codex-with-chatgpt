@@ -107,15 +107,25 @@ export async function stopBridge(workspaceRoot: string): Promise<boolean> {
   if (healthy && healthy.workspaceId === workspace.id) {
     try {
       await adminFetch(runtime, "POST", "/admin/shutdown", 5000);
-      return true;
+      return waitUntilStopped(workspace.id);
     } catch {
       // fall through to kill
     }
   }
   try {
     process.kill(runtime.pid, "SIGTERM");
-    return true;
+    return waitUntilStopped(workspace.id);
   } catch {
     return false;
   }
+}
+
+async function waitUntilStopped(workspaceId: string): Promise<boolean> {
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    const observation = await findBridgeObservation(workspaceId);
+    if (observation.state === "stopped") return true;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return false;
 }

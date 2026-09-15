@@ -3,6 +3,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import readline from "node:readline";
 import { IgnoreRules } from "./ignore.js";
+import { sanitizeWorkspaceText } from "./sanitize.js";
 import { readJsonIfExists } from "../config/paths.js";
 
 export type WorkspaceErrorCode =
@@ -57,7 +58,6 @@ export interface ListDirectoryResult {
 
 export interface ProjectConfig {
   name?: string;
-  maxIterations?: number;
 }
 
 function parseProjectConfig(value: unknown): ProjectConfig {
@@ -65,7 +65,6 @@ function parseProjectConfig(value: unknown): ProjectConfig {
   const raw = value as Record<string, unknown>;
   const config: ProjectConfig = {};
   if (typeof raw.name === "string") config.name = raw.name;
-  if (typeof raw.maxIterations === "number") config.maxIterations = raw.maxIterations;
   return config;
 }
 
@@ -142,6 +141,12 @@ export class Workspace {
     }
     let p = requested.trim();
     if (p === "" || p === "/") p = ".";
+    if (/^[a-zA-Z]:[\\/]/.test(p) || p.startsWith("\\\\")) {
+      throw new WorkspaceError(
+        "PATH_OUTSIDE_WORKSPACE",
+        `Windows absolute paths are not allowed: ${requested}`
+      );
+    }
     // Normalize separators so Windows-style input behaves identically everywhere.
     p = p.replace(/\\/g, "/");
     // Strip a "workspace:/" alias prefix if the model echoes it back.
@@ -231,6 +236,13 @@ export class Workspace {
     }
     rl.close();
 
+    const sanitized = sanitizeWorkspaceText(lines.join("\n"));
+    if (!sanitized.allowed) {
+      throw new WorkspaceError(
+        "ACCESS_DENIED_SENSITIVE_FILE",
+        `ACCESS_DENIED_SENSITIVE_FILE: '${rel}' contains private key material and cannot be read.`
+      );
+    }
     const remaining = Math.max(0, totalLines - actualEnd);
     return {
       path: rel,
@@ -241,7 +253,7 @@ export class Workspace {
       truncated: remaining > 0,
       remainingLines: remaining,
       nextStartLine: remaining > 0 ? actualEnd + 1 : null,
-      content: lines.join("\n"),
+      content: sanitized.text,
     };
   }
 

@@ -47,8 +47,16 @@ describe("path containment", () => {
   });
 
   it("rejects ../ traversal", () => {
-    expect(() => ws.resolve("../outside-file")).toThrowError(WorkspaceError);
-    expect(() => ws.resolve("../../etc/passwd")).toThrow(/PATH_OUTSIDE|outside/i);
+    for (const candidate of [
+      "../secret",
+      "../../.ssh",
+      "/etc/passwd",
+      "~/.ssh/id_ed25519",
+      "C:\\Users\\xxx\\.ssh",
+      "workspace:/../secret",
+    ]) {
+      expect(() => ws.resolve(candidate), candidate).toThrowError(WorkspaceError);
+    }
     try {
       ws.resolve("a/../../b");
     } catch (error) {
@@ -119,6 +127,23 @@ describe("sensitive files", () => {
     expectDenied("keys/id_rsa");
   });
 
+  it("denies Web3 wallet and secret paths", () => {
+    for (const candidate of [
+      "wallet/account.json",
+      "wallets/alice.json",
+      "keystore/key.json",
+      "keystores/key.json",
+      "mnemonic.txt",
+      "seed-phrase.txt",
+      "private_key.txt",
+      "deploy-secrets/mainnet.json",
+      "foundry.keystore",
+      "cast-wallet-prod",
+    ]) {
+      expectDenied(candidate);
+    }
+  });
+
   it("denies .ssh directories anywhere", () => {
     expectDenied("nested/.ssh/config");
   });
@@ -163,6 +188,19 @@ describe("read_file pagination", () => {
   it("reports FILE_NOT_FOUND for missing files", async () => {
     await expect(ws.readFile("nope.txt")).rejects.toMatchObject({ code: "FILE_NOT_FOUND" });
   });
+
+  it("rejects private-key blocks and redacts obvious secrets in safe-named files", async () => {
+    write(root, "notes.txt", "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\n");
+    await expect(ws.readFile("notes.txt")).rejects.toMatchObject({
+      code: "ACCESS_DENIED_SENSITIVE_FILE",
+    });
+
+    const key = `0x${"a".repeat(64)}`;
+    write(root, "config.example.ts", `const private_key = "${key}";\nconst hash = "${key}";\n`);
+    const result = await ws.readFile("config.example.ts");
+    expect(result.content).not.toContain(`private_key = "${key}"`);
+    expect(result.content).toContain("[REDACTED]");
+  });
 });
 
 describe("workspace identity", () => {
@@ -180,12 +218,10 @@ describe("workspace identity", () => {
       ".c2c.json",
       JSON.stringify({
         name: "Remi",
-        maxIterations: 12,
       })
     );
     const namedWs = new Workspace(named);
     expect(namedWs.name).toBe("Remi");
-    expect(namedWs.projectConfig.maxIterations).toBe(12);
     cleanup(named);
   });
 
