@@ -91,6 +91,8 @@ multiple projects.
 1. Run `c2c status -w <workspace> --json`.
 2. If healthy with a healthy Tunnel, reuse it. Do not restart.
 3. If stopped, run `c2c start -w <workspace> --tunnel`.
+   If it returns `TUNNEL_CHOICE_REQUIRED`, ask the user to explicitly choose
+   Named or Quick. Never choose Quick on their behalf.
 4. If state is unknown, do not start another process, delete runtime state, or
    kill it. Run read-only diagnostics and report the uncertainty.
 5. Report success only when Bridge health, public Tunnel health, and the
@@ -171,14 +173,16 @@ Codex with ChatGPT 需要把它自己的状态目录加入 Codex 可写目录。
 Wait for explicit approval. Only then run `c2c sandbox-allow --yes --json`.
 Never allow Home, `/`, `Library`, `.ssh`, `.aws`, or a project parent.
 
-3. Run `c2c setup -w <workspace>`. It starts the Bridge and secure connection,
+3. Inspect `c2c tunnel status -w <workspace> --json`. If preference is unset,
+   require an explicit Named or Quick choice; never default to Quick.
+4. Run `c2c setup -w <workspace>`. It starts the Bridge and selected connection,
    then prints the Connector name, Server URL, OAuth authentication choice,
    and manual setup guidance.
-4. Tell the user to configure the official custom Connector themselves.
+5. Tell the user to configure the official custom Connector themselves.
    C2C and Codex must not operate the ChatGPT account or settings.
-5. When the Connector authorization page requests a code, tell the user to run
+6. When the Connector authorization page requests a code, tell the user to run
    `c2c pair -w <workspace>` themselves and enter that one-time code.
-6. Verify locally with `c2c doctor -w <workspace> --no-fix`. Do not verify by
+7. Verify locally with `c2c doctor -w <workspace> --no-fix`. Do not verify by
    controlling ChatGPT.
 
 ## Planning workflow

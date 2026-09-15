@@ -41,7 +41,9 @@ OAuth: protected-resource discovery → dynamic client registration →
 authorization + user-entered one-time pairing code → PKCE token exchange.
 Raw tokens are returned to the OAuth client and only hashes persist locally.
 
-Setup: `c2c setup` starts Bridge/Tunnel and prints manual Connector settings.
+Setup requires an explicit Named or Quick preference. Unset returns
+`TUNNEL_CHOICE_REQUIRED`; it never implies Quick. `c2c setup` starts the
+Bridge/selected Tunnel and prints manual Connector settings.
 It does not mint a pairing code or operate ChatGPT. The user runs `c2c pair`
 only when the authorization page is ready.
 

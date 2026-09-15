@@ -94,10 +94,17 @@ packages or update the lockfile.
 ## First-time setup
 
 ```bash
+c2c tunnel choose -w /path/to/project --mode quick
+# Or configure a Named Tunnel as described below.
+
 c2c setup -w /path/to/project
 ```
 
-This starts the loopback Bridge, establishes the Cloudflare HTTPS Tunnel, and
+Tunnel choice is mandatory. If it is unset, `setup` returns
+`TUNNEL_CHOICE_REQUIRED` instead of creating a random Quick Tunnel. Pure local
+Bridge startup remains available without `--tunnel`.
+
+Setup starts the loopback Bridge, establishes the selected Tunnel, and
 prints the Connector name, Server URL, OAuth authentication choice, and manual
 configuration guide. It does not open ChatGPT or generate a pairing code.
 

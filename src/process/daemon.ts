@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureDir, getStateDir } from "../config/paths.js";
-import { findBridgeObservation, findLiveBridge, probeBridge, readRuntimeState, type RuntimeState } from "../bridge/runtime.js";
+import { findBridgeObservation, findLiveBridge, type RuntimeState } from "../bridge/runtime.js";
 import { Workspace } from "../workspace/manager.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -99,24 +99,73 @@ export async function adminFetch<T = unknown>(
   }
 }
 
+export async function verifyPublicConnectionOrStop(
+  runtime: RuntimeState,
+  publicUrl: string,
+  workspaceId: string,
+  fetchImpl: typeof fetch = fetch
+): Promise<void> {
+  try {
+    const health = await fetchImpl(`${publicUrl}/health`, { signal: AbortSignal.timeout(8000) });
+    if (!health.ok) throw new Error(`Tunnel health check returned HTTP ${health.status}`);
+    const payload = (await health.json().catch(() => null)) as { workspaceId?: string; status?: string } | null;
+    if (payload?.status !== "ok" || payload.workspaceId !== workspaceId) {
+      throw new Error("Tunnel health check returned the wrong workspace");
+    }
+    const mcp = await fetchImpl(`${publicUrl}/mcp`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", method: "ping", id: 1 }),
+      signal: AbortSignal.timeout(8000),
+    });
+    if (mcp.status !== 401) {
+      await mcp.body?.cancel().catch(() => undefined);
+      throw new Error(`Public MCP check returned HTTP ${mcp.status}, expected OAuth 401`);
+    }
+    await mcp.body?.cancel().catch(() => undefined);
+  } catch (error) {
+    try {
+      await adminFetch(runtime, "POST", "/admin/tunnel/stop", 5000);
+      const info = await adminFetch<{
+        publicUrl: string | null;
+        tunnel: { running: boolean; url: string | null };
+      }>(runtime, "GET", "/admin/info", 5000);
+      if (info.publicUrl || info.tunnel.running || info.tunnel.url) {
+        throw new Error("Tunnel still reports running after cleanup");
+      }
+    } catch (cleanupError) {
+      throw new Error(
+        `${(error as Error).message}; TUNNEL_CLEANUP_FAILED: ${(cleanupError as Error).message}`
+      );
+    }
+    throw error;
+  }
+}
+
 export async function stopBridge(workspaceRoot: string): Promise<boolean> {
   const workspace = new Workspace(workspaceRoot);
-  const runtime = readRuntimeState(workspace.id);
-  if (!runtime) return false;
-  const healthy = await probeBridge(runtime.port);
-  if (healthy && healthy.workspaceId === workspace.id) {
-    try {
-      await adminFetch(runtime, "POST", "/admin/shutdown", 5000);
-      return waitUntilStopped(workspace.id);
-    } catch {
-      // fall through to kill
-    }
+  const observation = await findBridgeObservation(workspace.id);
+  if (observation.state === "stopped") return false;
+  if (observation.state === "unknown") {
+    throw new Error(`Bridge state is uncertain (${observation.reason}); refusing to signal the recorded PID.`);
+  }
+  const runtime = observation.runtime;
+  const identity = await adminFetch<{ workspaceId: string; pid: number }>(runtime, "GET", "/admin/info", 5000);
+  if (identity.workspaceId !== workspace.id || identity.pid !== runtime.pid) {
+    throw new Error("Bridge runtime identity mismatch; refusing to signal the recorded PID.");
+  }
+  try {
+    await adminFetch(runtime, "POST", "/admin/shutdown", 5000);
+    if (await waitUntilStopped(workspace.id)) return true;
+  } catch {
+    // The authenticated admin identity was confirmed immediately above.
   }
   try {
     process.kill(runtime.pid, "SIGTERM");
     return waitUntilStopped(workspace.id);
-  } catch {
-    return false;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") return waitUntilStopped(workspace.id);
+    throw error;
   }
 }
 

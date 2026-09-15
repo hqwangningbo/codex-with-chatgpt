@@ -344,6 +344,26 @@ ID                                   NAME          CREATED
 });
 
 describe("tunnel preference state", () => {
+  it("maps unset, quick, and named preferences without an implicit Quick default", async () => {
+    stateDirs.push(isolateStateDir());
+    const unset = tunnelForWorkspace("choice-workspace");
+    expect(unset.status()).toMatchObject({ provider: "unconfigured", running: false });
+    await expect(unset.start(48765)).rejects.toThrow("TUNNEL_CHOICE_REQUIRED");
+
+    chooseQuickTunnel("choice-workspace");
+    expect(tunnelForWorkspace("choice-workspace").status().provider).toBe("cloudflare-quick");
+
+    writeTunnelState({
+      workspaceId: "choice-workspace",
+      preference: "named",
+      provider: "cloudflare-named",
+      tunnelName: "c2c-choice-workspace",
+      tunnelId: "88888888-8888-8888-8888-888888888888",
+      hostname: "c2c-choice.example.com",
+    });
+    expect(tunnelForWorkspace("choice-workspace").status().provider).toBe("cloudflare-named");
+  });
+
   it("asks once, then remembers a quick choice", () => {
     stateDirs.push(isolateStateDir());
     const unset = readTunnelState("ws1");

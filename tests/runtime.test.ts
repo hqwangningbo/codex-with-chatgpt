@@ -8,7 +8,7 @@ import {
   writeRuntimeState,
   type RuntimeState,
 } from "../src/bridge/runtime.js";
-import { ensureBridge } from "../src/process/daemon.js";
+import { ensureBridge, stopBridge } from "../src/process/daemon.js";
 import { SERVICE_NAME, VERSION } from "../src/version.js";
 import { Workspace } from "../src/workspace/manager.js";
 import { cleanup, isolateStateDir, makeTmpDir, write } from "./helpers.js";
@@ -80,6 +80,8 @@ describe("findBridgeObservation", () => {
       if (observation.state === "unknown") expect(observation.reason).toBe("probe_failed");
       expect(await findLiveBridge(workspace.id)).toBeNull();
       await expect(ensureBridge(root)).rejects.toThrow(/uncertain/);
+      await expect(stopBridge(root)).rejects.toThrow(/refusing to signal/);
+      expect(() => process.kill(child.pid!, 0)).not.toThrow();
     } finally {
       if (child.pid) {
         try {

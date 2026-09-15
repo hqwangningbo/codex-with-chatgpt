@@ -30,3 +30,38 @@ export interface TunnelProvider {
   getPublicUrl(): string | null;
   doctor(): Promise<TunnelDoctorReport>;
 }
+
+export class UnavailableTunnel implements TunnelProvider {
+  readonly name = "unconfigured";
+
+  constructor(private readonly reason: string) {}
+
+  async start(_localPort: number): Promise<string> {
+    throw new Error(this.reason);
+  }
+
+  async stop(): Promise<void> {}
+
+  async restart(localPort: number): Promise<string> {
+    return this.start(localPort);
+  }
+
+  status(): TunnelStatus {
+    return { running: false, url: null, provider: this.name, detail: this.reason };
+  }
+
+  getPublicUrl(): string | null {
+    return null;
+  }
+
+  async doctor(): Promise<TunnelDoctorReport> {
+    return {
+      provider: this.name,
+      binaryFound: false,
+      binaryPath: null,
+      running: false,
+      url: null,
+      problems: [this.reason],
+    };
+  }
+}

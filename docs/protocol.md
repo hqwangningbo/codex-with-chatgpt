@@ -12,7 +12,10 @@ Codex. C2C does not know which Chat, conversation, or Project the user chooses.
 
 ## Setup
 
-`c2c setup -w <workspace>` starts the loopback Bridge and Cloudflare Tunnel,
+An explicit Named or Quick preference is required. An unset preference returns
+`TUNNEL_CHOICE_REQUIRED` and never creates a Quick Tunnel.
+
+`c2c setup -w <workspace>` starts the loopback Bridge and selected Tunnel,
 persists the Workspace endpoint, and prints:
 
 - Connector name

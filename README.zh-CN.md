@@ -91,10 +91,16 @@ corepack pnpm test
 ## 首次配置
 
 ```bash
+c2c tunnel choose -w /path/to/project --mode quick
+# 或按下文配置 Named Tunnel
+
 c2c setup -w /path/to/project
 ```
 
-该命令启动 loopback Bridge、建立 Cloudflare HTTPS Tunnel，并输出 Connector
+必须明确选择 Tunnel。尚未选择时，`setup` 返回 `TUNNEL_CHOICE_REQUIRED`，不会
+自动创建随机 Quick Tunnel。纯本地 Bridge 仍可在不带 `--tunnel` 时启动。
+
+Setup 启动 loopback Bridge、建立已选择的 Tunnel，并输出 Connector
 名称、Server URL、OAuth 认证方式和人工配置指南。它不会打开 ChatGPT，也不会
 提前生成 Pairing Code。
 

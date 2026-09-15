@@ -65,5 +65,16 @@ describe("Bridge CLI lifecycle", () => {
     expect(stop.status, stop.stderr || stop.stdout).toBe(0);
     expect(JSON.parse(stop.stdout)).toMatchObject({ ok: true, stopped: true });
     expect(JSON.parse(runCli(["status", "--json", "-w", workspace]).stdout).state).toBe("stopped");
+
+    const rejectedTunnel = runCli(["start", "--tunnel", "--json", "-w", workspace]);
+    expect(rejectedTunnel.status).toBe(1);
+    expect(JSON.parse(rejectedTunnel.stdout)).toMatchObject({ ok: false, error: "TUNNEL_CHOICE_REQUIRED" });
+    const localOnly = JSON.parse(runCli(["status", "--json", "-w", workspace]).stdout);
+    expect(localOnly).toMatchObject({
+      state: "healthy",
+      bridge: { healthy: true },
+      tunnel: { running: false, provider: "unconfigured" },
+      mcpUrl: null,
+    });
   });
 });

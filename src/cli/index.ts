@@ -5,7 +5,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { startBridge } from "../bridge/server.js";
 import { findBridgeObservation, findLiveBridge, type RuntimeState } from "../bridge/runtime.js";
-import { adminFetch, ensureBridge, stopBridge } from "../process/daemon.js";
+import { adminFetch, ensureBridge, stopBridge, verifyPublicConnectionOrStop } from "../process/daemon.js";
 import { Workspace } from "../workspace/manager.js";
 import { AuthStore } from "../auth/store.js";
 import { detectTunnelBinaries } from "../tunnel/detect.js";
@@ -221,23 +221,6 @@ interface AdminInfo {
   startedAt: string;
 }
 
-async function assertPublicConnection(publicUrl: string, workspaceId: string): Promise<void> {
-  const health = await fetch(`${publicUrl}/health`, { signal: AbortSignal.timeout(8000) });
-  if (!health.ok) throw new Error(`Tunnel health check returned HTTP ${health.status}`);
-  const payload = (await health.json().catch(() => null)) as { workspaceId?: string; status?: string } | null;
-  if (payload?.status !== "ok" || payload.workspaceId !== workspaceId) {
-    throw new Error("Tunnel health check returned the wrong workspace");
-  }
-  const mcp = await fetch(`${publicUrl}/mcp`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ jsonrpc: "2.0", method: "ping", id: 1 }),
-    signal: AbortSignal.timeout(8000),
-  });
-  if (mcp.status !== 401) throw new Error(`Public MCP check returned HTTP ${mcp.status}, expected OAuth 401`);
-  await mcp.body?.cancel().catch(() => undefined);
-}
-
 async function ensureBridgeAndTunnel(
   workspaceRoot: string,
   opts: { tunnel: boolean }
@@ -245,6 +228,10 @@ async function ensureBridgeAndTunnel(
   const { runtime } = await ensureBridge(workspaceRoot);
   let info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
   let mcpUrl: string | null = info.publicUrl ? `${info.publicUrl}/mcp` : null;
+  let publicVerified = false;
+  if (opts.tunnel && readTunnelState(info.workspaceId).preference === "unset") {
+    throw new Error("TUNNEL_CHOICE_REQUIRED");
+  }
   if (opts.tunnel && (!info.publicUrl || !info.tunnel.running)) {
     const binaries = detectTunnelBinaries();
     if (!binaries.cloudflared) {
@@ -253,14 +240,19 @@ async function ensureBridgeAndTunnel(
       );
     }
     const result = await adminFetch<TunnelStartResponse>(runtime, "POST", "/admin/tunnel/start", 90_000);
-    if (!result.url) throw new Error(result.message ?? "Tunnel start failed");
+    if (!result.url) {
+      await adminFetch(runtime, "POST", "/admin/tunnel/stop", 5000).catch(() => undefined);
+      throw new Error(result.message ?? "Tunnel start failed");
+    }
+    await verifyPublicConnectionOrStop(runtime, result.url, info.workspaceId);
+    publicVerified = true;
     info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
     mcpUrl = `${result.url}/mcp`;
   }
   if (opts.tunnel) {
     const publicUrl = info.publicUrl ?? info.tunnel.url;
     if (!publicUrl) throw new Error("Tunnel did not publish a URL");
-    await assertPublicConnection(publicUrl, info.workspaceId);
+    if (!publicVerified) await verifyPublicConnectionOrStop(runtime, publicUrl, info.workspaceId);
     mcpUrl = `${publicUrl}/mcp`;
   }
   return { runtime, info, mcpUrl };
