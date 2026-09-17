@@ -261,7 +261,7 @@ describe("normalizeNamedTunnelHostname", () => {
 });
 
 describe("CloudflaredNamedTunnel", () => {
-  it("restarts the saved tunnel with the same hostname", async () => {
+  it("restarts the saved tunnel by UUID without a name lookup", async () => {
     const firstChild = new FakeCloudflaredProcess();
     const secondChild = new FakeCloudflaredProcess();
     const spawnImpl = vi.fn()
@@ -269,6 +269,7 @@ describe("CloudflaredNamedTunnel", () => {
       .mockReturnValueOnce(secondChild as unknown as ChildProcess);
     const tunnel = new CloudflaredNamedTunnel({
       tunnelName: "c2c-abcdef123456",
+      tunnelId: "77777777-7777-7777-7777-777777777777",
       hostname: "c2c-bifrost.example.com",
       binaryOverride: "cloudflared",
       spawnImpl,
@@ -292,11 +293,22 @@ describe("CloudflaredNamedTunnel", () => {
         "--url",
         "http://127.0.0.1:48766",
         "run",
-        "c2c-abcdef123456",
+        "77777777-7777-7777-7777-777777777777",
       ],
       { stdio: ["ignore", "pipe", "pipe"], windowsHide: true }
     );
     await tunnel.stop();
+  });
+
+  it("rejects a missing or invalid tunnel UUID", () => {
+    expect(
+      () =>
+        new CloudflaredNamedTunnel({
+          tunnelName: "c2c-abcdef123456",
+          tunnelId: "c2c-abcdef123456",
+          hostname: "c2c-bifrost.example.com",
+        })
+    ).toThrow("NAMED_TUNNEL_ID_MISSING");
   });
 });
 
@@ -374,6 +386,22 @@ describe("tunnel preference state", () => {
     expect(saved.preference).toBe("quick");
     expect(needsTunnelChoice(readTunnelState("ws1"))).toBe(false);
     expect(isNamedTunnelReady(saved)).toBe(false);
+  });
+
+  it("fails closed when saved Named state lacks a valid tunnel UUID", async () => {
+    stateDirs.push(isolateStateDir());
+    writeTunnelState({
+      workspaceId: "invalid-named-workspace",
+      preference: "named",
+      provider: "cloudflare-named",
+      tunnelName: "c2c-invalid-named-workspace",
+      tunnelId: "not-a-uuid",
+      hostname: "c2c-invalid.example.com",
+    });
+
+    const tunnel = tunnelForWorkspace("invalid-named-workspace");
+    expect(tunnel.status()).toMatchObject({ provider: "unconfigured", running: false });
+    await expect(tunnel.start(48765)).rejects.toThrow("NAMED_TUNNEL_ID_MISSING");
   });
 
   it("selects the saved Named provider after a Bridge restart", () => {

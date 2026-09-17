@@ -225,7 +225,12 @@ interface AdminInfo {
 async function ensureBridgeAndTunnel(
   workspaceRoot: string,
   opts: { tunnel: boolean }
-): Promise<{ runtime: RuntimeState; info: AdminInfo; mcpUrl: string | null }> {
+): Promise<{
+  runtime: RuntimeState;
+  info: AdminInfo;
+  mcpUrl: string | null;
+  publicVerification: "direct" | "system-proxy" | null;
+}> {
   const workspace = new Workspace(workspaceRoot);
   if (opts.tunnel && readTunnelState(workspace.id).preference === "unset") {
     throw new Error("TUNNEL_CHOICE_REQUIRED");
@@ -233,7 +238,7 @@ async function ensureBridgeAndTunnel(
   const { runtime } = await ensureBridge(workspaceRoot);
   let info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
   let mcpUrl: string | null = info.publicUrl ? `${info.publicUrl}/mcp` : null;
-  let publicVerified = false;
+  let publicVerification: "direct" | "system-proxy" | null = null;
   if (opts.tunnel && (!info.publicUrl || !info.tunnel.running)) {
     const binaries = detectTunnelBinaries();
     if (!binaries.cloudflared) {
@@ -241,18 +246,20 @@ async function ensureBridgeAndTunnel(
         "NEED_CLOUDFLARED: cloudflared is not installed. Install it first (macOS: brew install cloudflared)."
       );
     }
-    const url = await startTunnelAndVerify(runtime, info.workspaceId);
-    publicVerified = true;
+    const started = await startTunnelAndVerify(runtime, info.workspaceId);
+    publicVerification = started.transport;
     info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
-    mcpUrl = `${url}/mcp`;
+    mcpUrl = `${started.url}/mcp`;
   }
   if (opts.tunnel) {
     const publicUrl = info.publicUrl ?? info.tunnel.url;
     if (!publicUrl) throw new Error("Tunnel did not publish a URL");
-    if (!publicVerified) await verifyPublicConnectionOrStop(runtime, publicUrl, info.workspaceId);
+    if (!publicVerification) {
+      publicVerification = await verifyPublicConnectionOrStop(runtime, publicUrl, info.workspaceId);
+    }
     mcpUrl = `${publicUrl}/mcp`;
   }
-  return { runtime, info, mcpUrl };
+  return { runtime, info, mcpUrl, publicVerification };
 }
 
 program
@@ -299,7 +306,9 @@ program
   .action(async (opts: { workspace?: string; tunnel: boolean; json: boolean }) => {
     const root = resolveWorkspace(opts.workspace);
     try {
-      const { runtime, info, mcpUrl } = await ensureBridgeAndTunnel(root, { tunnel: opts.tunnel });
+      const { runtime, info, mcpUrl, publicVerification } = await ensureBridgeAndTunnel(root, {
+        tunnel: opts.tunnel,
+      });
       const connectorName = mcpUrl
         ? persistWorkspaceEndpoint({
             workspaceId: info.workspaceId,
@@ -310,9 +319,19 @@ program
           })
         : readLastEndpoint(info.workspaceId)?.connectorName;
       if (opts.json) {
-        say(JSON.stringify({ ok: true, port: runtime.port, workspaceId: info.workspaceId, mcpUrl, connectorName }));
+        say(
+          JSON.stringify({
+            ok: true,
+            port: runtime.port,
+            workspaceId: info.workspaceId,
+            mcpUrl,
+            connectorName,
+            publicVerification,
+          })
+        );
         return;
       }
+      if (publicVerification) say(`public verification: ${publicVerification}`);
       check(`当前项目已识别（${info.workspaceName}）`);
       check("Workspace Bridge：healthy");
       if (mcpUrl) {
@@ -666,12 +685,12 @@ program
             report.tunnel = { ok: false, detail: "NEED_CLOUDFLARED" };
           } else {
             const previousUrl = lastEndpoint?.publicUrl;
-            const startedUrl = await startTunnelAndVerify(runtime, info.workspaceId);
-            currentUrl = startedUrl;
+            const verifiedTunnel = await startTunnelAndVerify(runtime, info.workspaceId);
+            currentUrl = verifiedTunnel.url;
             healthy = true;
             info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
             const sameAddress =
-              previousUrl && normalizePublicUrl(previousUrl) === normalizePublicUrl(startedUrl);
+              previousUrl && normalizePublicUrl(previousUrl) === normalizePublicUrl(verifiedTunnel.url);
             results.push(sameAddress ? "已重新建立安全连接" : "已重新建立安全连接（地址已更换）");
           }
         } catch (error) {

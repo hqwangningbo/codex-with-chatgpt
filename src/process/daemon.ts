@@ -4,8 +4,67 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureDir, getStateDir } from "../config/paths.js";
 import { findBridgeObservation, findLiveBridge, type RuntimeState } from "../bridge/runtime.js";
+import {
+  curlFetchThroughProxy,
+  detectMacOsLoopbackHttpsProxy,
+  type ProxyDetector,
+  type ProxyFetcher,
+} from "../network/system-proxy.js";
 import { Workspace } from "../workspace/manager.js";
 import { SERVICE_NAME } from "../version.js";
+
+export type PublicVerificationTransport = "direct" | "system-proxy";
+
+export interface VerifyPublicDeps {
+  detectProxy?: ProxyDetector;
+  proxyFetch?: ProxyFetcher;
+}
+
+const TRANSPORT_CODES = new Set([
+  "ECONNREFUSED",
+  "ENETUNREACH",
+  "EHOSTUNREACH",
+  "ETIMEDOUT",
+  "ECONNRESET",
+]);
+
+function collectErrorCodes(error: unknown, into = new Set<string>()): Set<string> {
+  if (!error || typeof error !== "object") return into;
+  const err = error as { code?: unknown; cause?: unknown; errors?: unknown[] };
+  if (typeof err.code === "string") into.add(err.code);
+  if (err.cause) collectErrorCodes(err.cause, into);
+  if (Array.isArray(err.errors)) {
+    for (const nested of err.errors) collectErrorCodes(nested, into);
+  }
+  return into;
+}
+
+export function isPublicTransportError(error: unknown): boolean {
+  const codes = collectErrorCodes(error);
+  for (const code of codes) {
+    if (TRANSPORT_CODES.has(code)) return true;
+  }
+  return false;
+}
+
+function assertHealthPayload(status: number, body: string, workspaceId: string): void {
+  if (status !== 200) throw new Error(`Tunnel health check returned HTTP ${status}`);
+  let payload: { service?: string; workspaceId?: string; status?: string } | null = null;
+  try {
+    payload = JSON.parse(body) as { service?: string; workspaceId?: string; status?: string };
+  } catch {
+    payload = null;
+  }
+  if (payload?.service !== SERVICE_NAME || payload.status !== "ok" || payload.workspaceId !== workspaceId) {
+    throw new Error("Tunnel health check returned the wrong service or workspace");
+  }
+}
+
+function assertMcpUnauthorized(status: number): void {
+  if (status !== 401) {
+    throw new Error(`Public MCP check returned HTTP ${status}, expected OAuth 401`);
+  }
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -100,42 +159,74 @@ export async function adminFetch<T = unknown>(
   }
 }
 
-export async function verifyPublicConnection(
+async function verifyDirectPublicConnection(
   publicUrl: string,
   workspaceId: string,
-  fetchImpl: typeof fetch = fetch
+  fetchImpl: typeof fetch
 ): Promise<void> {
   const health = await fetchImpl(`${publicUrl}/health`, { signal: AbortSignal.timeout(8000) });
-  if (!health.ok) throw new Error(`Tunnel health check returned HTTP ${health.status}`);
-  const payload = (await health.json().catch(() => null)) as {
-    service?: string;
-    workspaceId?: string;
-    status?: string;
-  } | null;
-  if (payload?.service !== SERVICE_NAME || payload.status !== "ok" || payload.workspaceId !== workspaceId) {
-    throw new Error("Tunnel health check returned the wrong service or workspace");
-  }
+  const healthBody = await health.text();
+  assertHealthPayload(health.status, healthBody, workspaceId);
   const mcp = await fetchImpl(`${publicUrl}/mcp`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ jsonrpc: "2.0", method: "ping", id: 1 }),
     signal: AbortSignal.timeout(8000),
   });
-  if (mcp.status !== 401) {
-    await mcp.body?.cancel().catch(() => undefined);
-    throw new Error(`Public MCP check returned HTTP ${mcp.status}, expected OAuth 401`);
-  }
   await mcp.body?.cancel().catch(() => undefined);
+  assertMcpUnauthorized(mcp.status);
+}
+
+async function verifyProxyPublicConnection(
+  publicUrl: string,
+  workspaceId: string,
+  deps: VerifyPublicDeps
+): Promise<void> {
+  const detectProxy = deps.detectProxy ?? detectMacOsLoopbackHttpsProxy;
+  const proxyFetch = deps.proxyFetch ?? curlFetchThroughProxy;
+  const proxy = await detectProxy();
+  if (!proxy) throw new Error("No macOS loopback HTTPS system proxy available");
+  const health = await proxyFetch(`${publicUrl}/health`, proxy);
+  assertHealthPayload(health.status, health.body, workspaceId);
+  const mcp = await proxyFetch(`${publicUrl}/mcp`, proxy, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", method: "ping", id: 1 }),
+  });
+  assertMcpUnauthorized(mcp.status);
+}
+
+export async function verifyPublicConnection(
+  publicUrl: string,
+  workspaceId: string,
+  fetchImpl: typeof fetch = fetch,
+  deps: VerifyPublicDeps = {}
+): Promise<PublicVerificationTransport> {
+  try {
+    await verifyDirectPublicConnection(publicUrl, workspaceId, fetchImpl);
+    return "direct";
+  } catch (error) {
+    if (!isPublicTransportError(error)) throw error;
+    try {
+      await verifyProxyPublicConnection(publicUrl, workspaceId, deps);
+      return "system-proxy";
+    } catch (proxyError) {
+      throw new Error(
+        `${(error as Error).message}; proxy fallback failed: ${(proxyError as Error).message}`
+      );
+    }
+  }
 }
 
 export async function verifyPublicConnectionOrStop(
   runtime: RuntimeState,
   publicUrl: string,
   workspaceId: string,
-  fetchImpl: typeof fetch = fetch
-): Promise<void> {
+  fetchImpl: typeof fetch = fetch,
+  deps: VerifyPublicDeps = {}
+): Promise<PublicVerificationTransport> {
   try {
-    await verifyPublicConnection(publicUrl, workspaceId, fetchImpl);
+    return await verifyPublicConnection(publicUrl, workspaceId, fetchImpl, deps);
   } catch (error) {
     try {
       await adminFetch(runtime, "POST", "/admin/tunnel/stop", 5000);
@@ -158,8 +249,9 @@ export async function verifyPublicConnectionOrStop(
 export async function startTunnelAndVerify(
   runtime: RuntimeState,
   workspaceId: string,
-  fetchImpl: typeof fetch = fetch
-): Promise<string> {
+  fetchImpl: typeof fetch = fetch,
+  deps: VerifyPublicDeps = {}
+): Promise<{ url: string; transport: PublicVerificationTransport }> {
   const started = await adminFetch<{ url?: string; message?: string }>(
     runtime,
     "POST",
@@ -170,8 +262,14 @@ export async function startTunnelAndVerify(
     await adminFetch(runtime, "POST", "/admin/tunnel/stop", 5000).catch(() => undefined);
     throw new Error(started.message ?? "Tunnel start failed");
   }
-  await verifyPublicConnectionOrStop(runtime, started.url, workspaceId, fetchImpl);
-  return started.url;
+  const transport = await verifyPublicConnectionOrStop(
+    runtime,
+    started.url,
+    workspaceId,
+    fetchImpl,
+    deps
+  );
+  return { url: started.url, transport };
 }
 
 export async function stopBridge(workspaceRoot: string): Promise<boolean> {

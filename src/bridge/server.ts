@@ -11,7 +11,7 @@ import { createMcpHttpHandler } from "../mcp/http.js";
 import { CloudflaredQuickTunnel } from "../tunnel/cloudflared.js";
 import { CloudflaredNamedTunnel } from "../tunnel/cloudflared-named.js";
 import { UnavailableTunnel, type TunnelProvider } from "../tunnel/provider.js";
-import { namedTunnelBinding, readTunnelState } from "../tunnel/state.js";
+import { isNamedTunnelId, namedTunnelBinding, readTunnelState } from "../tunnel/state.js";
 import { Logger, nullLogger } from "../logger/index.js";
 import { DEFAULT_HOST, DEFAULT_PORT } from "../config/paths.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
@@ -23,12 +23,16 @@ export function tunnelForWorkspace(workspaceId: string, logger: Logger = nullLog
   if (binding) {
     return new CloudflaredNamedTunnel({
       tunnelName: binding.tunnelName,
+      tunnelId: binding.tunnelId,
       hostname: binding.hostname,
       logger,
     });
   }
   if (state.preference === "quick") return new CloudflaredQuickTunnel(logger);
   if (state.preference === "named") {
+    if (!isNamedTunnelId(state.tunnelId)) {
+      return new UnavailableTunnel("NAMED_TUNNEL_ID_MISSING");
+    }
     return new UnavailableTunnel("NAMED_TUNNEL_NOT_CONFIGURED");
   }
   return new UnavailableTunnel("TUNNEL_CHOICE_REQUIRED");

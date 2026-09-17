@@ -44,14 +44,20 @@ export function isNamedTunnelReady(state: TunnelState): boolean {
     state.preference === "named" &&
     state.provider === "cloudflare-named" &&
     Boolean(state.tunnelName?.trim()) &&
-    Boolean(state.tunnelId?.trim()) &&
+    isNamedTunnelId(state.tunnelId) &&
     Boolean(state.hostname?.trim())
   );
 }
 
-export function namedTunnelBinding(state: TunnelState): { tunnelName: string; hostname: string } | null {
-  if (!isNamedTunnelReady(state) || !state.tunnelName || !state.hostname) return null;
-  return { tunnelName: state.tunnelName, hostname: state.hostname };
+export function isNamedTunnelId(tunnelId: string | undefined): tunnelId is string {
+  return /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(tunnelId?.trim() ?? "");
+}
+
+export function namedTunnelBinding(
+  state: TunnelState
+): { tunnelName: string; tunnelId: string; hostname: string } | null {
+  if (!isNamedTunnelReady(state) || !state.tunnelName || !state.tunnelId || !state.hostname) return null;
+  return { tunnelName: state.tunnelName, tunnelId: state.tunnelId, hostname: state.hostname };
 }
 
 export function findHostnameOwner(hostname: string, workspaceId: string): TunnelState | null {
