@@ -169,9 +169,9 @@ export function registerWebCommands(program: Command, helpers: CliHelpers): void
       .command("stop")
       .description("Stop the Web Research Harness without touching Bridge or Tunnel")
       .option("--json", "machine-readable output", false)
-  ).action((opts: { json: boolean }) => {
+  ).action(async (opts: { json: boolean }) => {
     try {
-      const payload = stopWebTask();
+      const payload = await stopWebTask();
       if (opts.json) say(JSON.stringify(payload));
       else check("Web Research Harness 已停止");
     } catch (error) {

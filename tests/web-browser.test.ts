@@ -272,3 +272,35 @@ describe("Temporary Chat extractor contract", () => {
     expect(source).not.toContain("el.textContent ?? \"\"");
   });
 });
+
+describe("browser navigation allowlist", () => {
+  it("allows login hosts and denies off-domain pages and popups", async () => {
+    const { navigationDecision } = await import("../src/web/session.js");
+    expect(navigationDecision("https://chatgpt.com/?temporary-chat=true", "login")).toBe("allow");
+    expect(navigationDecision("https://www.chatgpt.com/", "login")).toBe("allow");
+    expect(navigationDecision("https://auth.openai.com/authorize", "login")).toBe("allow");
+    expect(navigationDecision("https://accounts.google.com/o/oauth2", "login")).toBe("allow");
+    expect(navigationDecision("https://oauth.google.com/auth", "login")).toBe("allow");
+    expect(navigationDecision("https://login.microsoftonline.com/common", "login")).toBe("allow");
+    expect(navigationDecision("https://contoso.microsoftonline.com/", "login")).toBe("allow");
+    expect(navigationDecision("https://appleid.apple.com/auth/authorize", "login")).toBe("allow");
+    expect(navigationDecision("about:blank", "login")).toBe("ignore");
+    expect(navigationDecision("https://evil.example/popup", "login")).toBe("deny");
+    expect(navigationDecision("https://bing.com/search?q=chatgpt", "login")).toBe("deny");
+    expect(navigationDecision("https://login.live.com/", "login")).toBe("deny");
+  });
+
+  it("restricts research navigation to chatgpt.com, including popups", async () => {
+    const { navigationDecision } = await import("../src/web/session.js");
+    expect(navigationDecision("https://chatgpt.com/?temporary-chat=true", "research")).toBe("allow");
+    expect(navigationDecision("https://www.chatgpt.com/", "research")).toBe("allow");
+    expect(navigationDecision("https://auth.openai.com/authorize", "research")).toBe("deny");
+    expect(navigationDecision("https://accounts.google.com/o/oauth2", "research")).toBe("deny");
+    expect(navigationDecision("https://www.google.com/search?q=erc-7540", "research")).toBe("deny");
+    expect(navigationDecision("https://evil.example/popup", "research")).toBe("deny");
+    const source = fs.readFileSync(path.join(root, "src/web/session.ts"), "utf8");
+    expect(source).toContain('context.on("page"');
+    expect(source).toContain("popup");
+    expect(source).toContain("assertAllowedUrl");
+  });
+});

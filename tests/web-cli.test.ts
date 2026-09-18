@@ -9,7 +9,7 @@ import { Workspace } from "../src/workspace/manager.js";
 import type { ChatSession } from "../src/web/session.js";
 import type { ChatGptSnapshot } from "../src/web/selectors.js";
 import { ACTION_CLOSE, ACTION_OPEN, WEB_PROTOCOL } from "../src/web/protocol.js";
-import { inspectProcess, readWebRuntime, writeWebRuntime } from "../src/web/state.js";
+import { inspectProcess, isWebResearchCommand, readWebRuntime, stopWebTask, writeWebRuntime } from "../src/web/state.js";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const cliEntry = path.join(projectRoot, "src/cli/index.ts");
@@ -149,6 +149,105 @@ describe("web stop PID identity", () => {
           /* ignore */
         }
       }
+    }
+  });
+});
+
+function spawnFakeWebOwner(ignoreTerm: boolean): { child: ReturnType<typeof spawn>; dir: string; ready: string } {
+  const dir = makeTmpDir("web-owner");
+  fs.mkdirSync(path.join(dir, "cli"), { recursive: true });
+  const ready = path.join(dir, "ready");
+  const ignore = ignoreTerm ? `process.on("SIGTERM", () => {});\n` : "";
+  const script = `import fs from "node:fs";
+${ignore}fs.writeFileSync(${JSON.stringify(ready)}, "1");
+setInterval(() => {}, 1000);
+`;
+  const file = path.join(dir, "cli", "index.js");
+  fs.writeFileSync(file, script);
+  const child = spawn(process.execPath, [file, "web", "research"], { stdio: "ignore", detached: true });
+  child.unref();
+  if (!child.pid) throw new Error("failed to spawn helper");
+  return { child, dir, ready };
+}
+
+async function waitForFile(file: string, timeoutMs = 2000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (fs.existsSync(file)) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`helper did not become ready: ${file}`);
+}
+
+async function recordFakeOwner(child: ReturnType<typeof spawn>): Promise<void> {
+  if (!child.pid) throw new Error("failed to spawn helper");
+  const live = inspectProcess(child.pid);
+  expect(live.alive).toBe(true);
+  expect(isWebResearchCommand(live.command)).toBe(true);
+  writeWebRuntime({
+    pid: child.pid,
+    requestId: "c2c_wr_owner",
+    workspaceId: "ws",
+    startedAt: new Date().toISOString(),
+    processStartedAt: live.startedAt,
+    command: live.command,
+    stepCount: 1,
+    status: "running",
+  });
+}
+
+describe("web stop waits for owner exit", () => {
+  it("does not announce success while a proven owner ignores SIGTERM", async () => {
+    process.env.C2C_STATE_DIR = stateDir;
+    const { child, dir, ready } = spawnFakeWebOwner(true);
+    try {
+      await waitForFile(ready);
+      await recordFakeOwner(child);
+      await expect(stopWebTask({ waitMs: 400 })).rejects.toMatchObject({ code: "WEB_STOP_TIMEOUT" });
+      expect(readWebRuntime().status).toBe("running");
+      expect(readWebRuntime().pid).toBe(child.pid);
+      expect(() => process.kill(child.pid!, 0)).not.toThrow();
+      const loopRoot = makeTmpDir("web-busy");
+      write(loopRoot, "hello.txt", "hello\n");
+      await expect(
+        runResearchTurn({
+          workspace: new Workspace(loopRoot),
+          task: "should be busy",
+          session: new FakeSession(),
+        })
+      ).rejects.toMatchObject({ code: "WEB_RESEARCH_BUSY" });
+      cleanup(loopRoot);
+    } finally {
+      if (child.pid) {
+        try {
+          process.kill(child.pid, "SIGKILL");
+        } catch {
+          /* ignore */
+        }
+      }
+      cleanup(dir);
+    }
+  });
+
+  it("marks interrupted only after the proven owner actually exits", async () => {
+    process.env.C2C_STATE_DIR = stateDir;
+    const { child, dir, ready } = spawnFakeWebOwner(false);
+    try {
+      await waitForFile(ready);
+      await recordFakeOwner(child);
+      await expect(stopWebTask({ waitMs: 2000 })).resolves.toMatchObject({ ok: true, stopped: true });
+      expect(readWebRuntime().status).toBe("interrupted");
+      expect(readWebRuntime().pid).toBeNull();
+      expect(() => process.kill(child.pid!, 0)).toThrow();
+    } finally {
+      if (child.pid) {
+        try {
+          process.kill(child.pid, "SIGKILL");
+        } catch {
+          /* ignore */
+        }
+      }
+      cleanup(dir);
     }
   });
 });

@@ -24,6 +24,48 @@ const LOGIN_HOSTS = new Set([
   "appleid.apple.com",
 ]);
 
+export type WebNavigationMode = "login" | "research";
+export type NavigationDecision = "allow" | "ignore" | "deny";
+
+export function allowedLoginHost(hostname: string): boolean {
+  const host = hostname.toLowerCase();
+  return (
+    LOGIN_HOSTS.has(host) ||
+    host.endsWith(".google.com") ||
+    host.endsWith(".microsoftonline.com")
+  );
+}
+
+export function allowedResearchHost(hostname: string): boolean {
+  const host = hostname.toLowerCase();
+  return host === "chatgpt.com" || host === "www.chatgpt.com";
+}
+
+export function navigationDecision(url: string, mode: WebNavigationMode): NavigationDecision {
+  const trimmed = url.trim();
+  if (!trimmed || trimmed === "about:blank") return "ignore";
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return "deny";
+  }
+  if (parsed.protocol === "chrome:" || parsed.protocol === "edge:" || parsed.protocol === "devtools:") {
+    return "ignore";
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return "deny";
+  const host = parsed.hostname;
+  if (!host) return "deny";
+  if (mode === "research") return allowedResearchHost(host) ? "allow" : "deny";
+  return allowedLoginHost(host) ? "allow" : "deny";
+}
+
+function assertAllowedUrl(url: string, mode: WebNavigationMode): void {
+  if (navigationDecision(url, mode) === "deny") {
+    throw new WebError("WEB_UI_DRIFT", `Blocked navigation to ${url}`);
+  }
+}
+
 export interface ChatSession {
   snapshot(): Promise<ChatGptSnapshot>;
   ensureReady(): Promise<ChatGptSnapshot>;
@@ -73,21 +115,65 @@ export async function openChatSession(input: {
 
 export class PlaywrightChatSession implements ChatSession {
   private readonly sendGuard = new SendGuard();
+  private readonly mode: WebNavigationMode;
+  private drift: WebError | null = null;
 
   constructor(
     private readonly context: BrowserContext,
     private readonly page: Page,
     private readonly loginMode: boolean
-  ) {}
+  ) {
+    this.mode = loginMode ? "login" : "research";
+    this.guardContext();
+  }
+
+  private failClosed(error: WebError): void {
+    this.drift = error;
+    void this.context.close().catch(() => undefined);
+  }
+
+  private throwIfDrifted(): void {
+    if (this.drift) throw this.drift;
+  }
+
+  private guardPage(page: Page): void {
+    const check = (url: string): void => {
+      try {
+        assertAllowedUrl(url, this.mode);
+      } catch (error) {
+        if (error instanceof WebError) {
+          void page.close().catch(() => undefined);
+          this.failClosed(error);
+        }
+      }
+    };
+    page.on("framenavigated", (frame) => {
+      if (frame === page.mainFrame()) check(frame.url());
+    });
+    page.on("popup", (popup) => {
+      this.guardPage(popup);
+      check(popup.url());
+    });
+    check(page.url());
+  }
+
+  private guardContext(): void {
+    for (const page of this.context.pages()) this.guardPage(page);
+    this.context.on("page", (page) => this.guardPage(page));
+  }
 
   async snapshot(): Promise<ChatGptSnapshot> {
+    this.throwIfDrifted();
     return readSnapshot(this.page);
   }
 
   async ensureReady(): Promise<ChatGptSnapshot> {
+    this.throwIfDrifted();
     await this.page.goto(TEMPORARY_CHAT_URL, { waitUntil: "domcontentloaded" });
+    this.throwIfDrifted();
     const deadline = Date.now() + (this.loginMode ? 10 * 60_000 : 45_000);
     while (Date.now() < deadline) {
+      this.throwIfDrifted();
       const snapshot = await this.snapshot();
       const kind = classifyPage(snapshot);
       if (kind === "challenge" || kind === "rate_limit" || kind === "usage_limit") failFromSnapshot(snapshot);
@@ -100,6 +186,7 @@ export class PlaywrightChatSession implements ChatSession {
   }
 
   async sendAndWait(text: string, opts: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<string> {
+    this.throwIfDrifted();
     this.sendGuard.assertCanSend();
     const before = await this.snapshot();
     if (!sessionIsReady(before)) failFromSnapshot(before);
@@ -131,6 +218,7 @@ export class PlaywrightChatSession implements ChatSession {
     let stableSince = 0;
     while (Date.now() < deadline) {
       if (opts.signal?.aborted) throw new WebError("WEB_TIMEOUT", "Research was cancelled");
+      this.throwIfDrifted();
       const snapshot = await this.snapshot();
       const watched = watchSentTurn(baseline, snapshot);
       if (watched.status === "fail") {
@@ -168,8 +256,4 @@ export class PlaywrightChatSession implements ChatSession {
   async close(): Promise<void> {
     await this.context.close();
   }
-}
-
-export function allowedLoginHost(hostname: string): boolean {
-  return LOGIN_HOSTS.has(hostname) || hostname.endsWith(".google.com") || hostname.endsWith(".microsoftonline.com");
 }

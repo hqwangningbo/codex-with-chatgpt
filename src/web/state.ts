@@ -199,7 +199,14 @@ export function markWebInterrupted(): void {
   writeWebRuntime({ ...state, status: "interrupted", pid: null, processStartedAt: null, command: null });
 }
 
-export function stopWebTask(): { ok: true; stopped: true; stale?: boolean } {
+export const WEB_STOP_WAIT_MS = 10_000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export async function stopWebTask(opts?: { waitMs?: number }): Promise<{ ok: true; stopped: true; stale?: boolean }> {
+  const waitMs = opts?.waitMs && opts.waitMs > 0 ? opts.waitMs : WEB_STOP_WAIT_MS;
   const runtime = readWebRuntime();
   if (runtime.status !== "running" || !runtime.pid) {
     markWebInterrupted();
@@ -223,8 +230,25 @@ export function stopWebTask(): { ok: true; stopped: true; stale?: boolean } {
   try {
     process.kill(runtime.pid, "SIGTERM");
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+      markWebInterrupted();
+      return { ok: true, stopped: true, stale: true };
+    }
+    throw error;
   }
-  markWebInterrupted();
-  return { ok: true, stopped: true };
+
+  const deadline = Date.now() + waitMs;
+  while (Date.now() < deadline) {
+    const current = inspectProcess(runtime.pid);
+    if (!current.alive) {
+      markWebInterrupted();
+      return { ok: true, stopped: true };
+    }
+    if (current.startedAt && runtime.processStartedAt && current.startedAt !== runtime.processStartedAt) {
+      markWebInterrupted();
+      return { ok: true, stopped: true };
+    }
+    await sleep(100);
+  }
+  throw new WebError("WEB_STOP_TIMEOUT", "Web Research owner did not exit after SIGTERM");
 }
