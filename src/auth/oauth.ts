@@ -74,8 +74,10 @@ function pairingPage(opts: {
   const scopeLabels: Record<string, string> = {
     "workspace.read": "Read files in this workspace",
     "workspace.search": "Search this workspace",
+    "workspace.write": "Write files inside the locally authorized Writable Root",
     "git.read": "Read git status and diffs",
     "execution.read": "Read Codex execution summaries",
+    "execution.poc": "Run sandboxed POC programs inside the locally authorized Writable Root",
     offline_access: "Stay connected between sessions",
   };
   const scopeList = opts.scopes
@@ -119,7 +121,7 @@ function pairingPage(opts: {
 <body>
 <div class="card">
   <h1>${escapedProductName}</h1>
-  <p class="sub">ChatGPT is requesting access to workspace <strong>${escapedWorkspaceName}</strong> (read-only):</p>
+  <p class="sub">ChatGPT is requesting the following access to workspace <strong>${escapedWorkspaceName}</strong>:</p>
   <ul>${scopeList}</ul>
   <form method="POST" action="authorize">
     <input type="hidden" name="request_id" value="${escapedRequestId}">

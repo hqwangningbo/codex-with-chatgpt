@@ -16,6 +16,7 @@ import { Logger, nullLogger } from "../logger/index.js";
 import { DEFAULT_HOST, DEFAULT_PORT } from "../config/paths.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
 import { writeRuntimeState, clearRuntimeState, type RuntimeState } from "./runtime.js";
+import { clearWriteScope, writeScopeInfo } from "../write-scope/state.js";
 
 export function tunnelForWorkspace(workspaceId: string, logger: Logger = nullLogger): TunnelProvider {
   const state = readTunnelState(workspaceId);
@@ -102,6 +103,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   const adminToken = `c2c_admin_${randomBytes(24).toString("base64url")}`;
 
   let publicBaseUrl: string | null = null;
+  const startedAt = new Date().toISOString();
 
   const app = express();
   app.set("trust proxy", true);
@@ -134,7 +136,10 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
 
   // ---- MCP endpoint (bearer-protected) --------------------------------------
 
-  const mcpHandler = createMcpHttpHandler(() => createMcpServer({ workspace, logger }), logger);
+  const mcpHandler = createMcpHttpHandler(
+    () => createMcpServer({ workspace, logger, bridgeStartedAt: startedAt }),
+    logger
+  );
   app.all(
     "/mcp",
     express.json({ limit: "8mb" }),
@@ -180,6 +185,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       pairingActive: pairing.hasActiveSession(),
       pid: process.pid,
       startedAt,
+      writeScope: writeScopeInfo(workspace.id, startedAt),
     });
   });
 
@@ -226,7 +232,6 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   });
 
   const { server, port } = await listen(app, host, opts.port ?? DEFAULT_PORT);
-  const startedAt = new Date().toISOString();
   logger.info(`Bridge listening on ${host}:${port} for workspace ${workspace.name} (${workspace.id})`);
 
   const persistRuntime = (): void => {
@@ -252,6 +257,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     closed = true;
     await tunnel.stop().catch(() => undefined);
     await new Promise<void>((resolve) => server.close(() => resolve()));
+    clearWriteScope(workspace.id);
     if (opts.persistRuntime !== false) clearRuntimeState(workspace.id);
     logger.info("Bridge stopped");
   };

@@ -31,6 +31,7 @@ const normCase = (p: string): string => (CASE_INSENSITIVE ? p.toLowerCase() : p)
 
 export interface ReadFileResult {
   path: string;
+  sha256: string;
   sizeBytes: number;
   totalLines: number;
   startLine: number;
@@ -188,6 +189,12 @@ export class Workspace {
     }
   }
 
+  private async sha256File(abs: string): Promise<string> {
+    const hash = createHash("sha256");
+    for await (const chunk of fs.createReadStream(abs)) hash.update(chunk as Buffer);
+    return hash.digest("hex");
+  }
+
   async readFile(
     requested: string,
     opts: { startLine?: number; endLine?: number; maxLines?: number; maxBytes?: number } = {}
@@ -246,6 +253,7 @@ export class Workspace {
     const remaining = Math.max(0, totalLines - actualEnd);
     return {
       path: rel,
+      sha256: await this.sha256File(abs),
       sizeBytes: stat.size,
       totalLines,
       startLine: Math.min(startLine, Math.max(totalLines, 1)),

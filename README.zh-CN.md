@@ -16,7 +16,7 @@
                │
         Official Connector
                │
-          Read-only MCP
+        默认只读的 MCP
                │
                ▼
 ┌─────────────────────────────┐
@@ -53,7 +53,7 @@ Manual Safe Mode 是默认且唯一推荐模式。这样可减少账号自动化
 代码环境中的额外攻击面。可选固定 Tunnel 的 Cloudflare 账号授权仍是独立、
 明确的人工操作。
 
-## Read-only MCP 工具
+## MCP 工具
 
 公网 MCP 只公开：
 
@@ -66,9 +66,23 @@ Manual Safe Mode 是默认且唯一推荐模式。这样可减少账号自动化
 - `test_status`
 - `execution_summary`
 - `execution_output`
+- `write_scope_info`（只读）
+- `write_file`（需要显式 OAuth scope + 本机 Writable Root）
+- `run_poc`（需要显式 OAuth scope + 本机 `poc` mode）
 
-不存在写文件、命令执行、安装依赖或 Git 写操作工具。ChatGPT 无法通过 C2C
-修改 Workspace。
+默认 OAuth 授权仍严格只读。只有用户在本机明确设置 session-bound、
+Workspace-relative Writable Root 后，受限写工具才可能使用。不存在任意 Shell、
+安装依赖、删除、重命名或 Git 写工具。`.env`、任意 `.env.*` 和
+`.env.example` 永久禁止写入。
+
+```bash
+c2c write-scope set -w <workspace> --root docs/research --mode write
+c2c write-scope status -w <workspace>
+c2c write-scope clear -w <workspace>
+```
+
+源码目录还需要 `--yes`；根目录 `.` 还需要 `--allow-workspace-root`。
+`c2c stop` 会清除当前 Writable Scope。
 
 ## 安全安装
 

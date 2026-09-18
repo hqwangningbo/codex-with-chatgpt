@@ -6,12 +6,22 @@ import { ensureDir, getStateDir, readJsonIfExists, writeSecureJson } from "../co
 export const SUPPORTED_SCOPES = [
   "workspace.read",
   "workspace.search",
+  "workspace.write",
   "git.read",
   "execution.read",
+  "execution.poc",
   "offline_access",
 ] as const;
 
 export type Scope = (typeof SUPPORTED_SCOPES)[number];
+
+export const DEFAULT_SCOPES: Scope[] = [
+  "workspace.read",
+  "workspace.search",
+  "git.read",
+  "execution.read",
+  "offline_access",
+];
 
 export interface ClientRegistration {
   clientId: string;
@@ -271,7 +281,7 @@ export class AuthStore {
 }
 
 export function filterScopes(requested: string | undefined): string[] {
-  if (!requested || requested.trim() === "") return [...SUPPORTED_SCOPES];
+  if (!requested || requested.trim() === "") return [...DEFAULT_SCOPES];
   const asked = requested.split(/[\s+]+/).filter(Boolean);
   const granted = asked.filter((scope) => (SUPPORTED_SCOPES as readonly string[]).includes(scope));
   return granted;

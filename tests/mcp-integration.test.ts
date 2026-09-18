@@ -6,6 +6,8 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { startBridge, type Bridge } from "../src/bridge/server.js";
 import { appendExecutionRecord } from "../src/execution/records.js";
 import { saveExecutionOutput } from "../src/execution/output.js";
+import { adminFetch } from "../src/process/daemon.js";
+import { clearWriteScope, setWriteScope } from "../src/write-scope/state.js";
 import { makeTmpDir, cleanup, write, makeGitRepo, git, isolateStateDir } from "./helpers.js";
 
 let root: string;
@@ -47,6 +49,7 @@ beforeAll(async () => {
   makeGitRepo(root);
   write(root, "package.json", JSON.stringify({ name: "demo", scripts: { test: "vitest run" }, dependencies: { react: "^19.0.0" } }));
   write(root, ".env", "API_KEY=supersecret\n");
+  write(root, "foo/.env.local", "NESTED_SECRET=never-return-this\n");
   // an uncommitted change so git_diff has content
   write(root, "src/index.ts", "export const answer = 43; // changed\n");
 
@@ -76,7 +79,7 @@ afterAll(async () => {
 });
 
 describe("MCP tools over Streamable HTTP", () => {
-  it("lists all nine read-only tools", async () => {
+  it("lists the read tools and only the two explicitly constrained mutable tools", async () => {
     const { tools } = await client.listTools();
     const names = tools.map((tool) => tool.name).sort();
     expect(names).toEqual([
@@ -86,27 +89,40 @@ describe("MCP tools over Streamable HTTP", () => {
       "git_status",
       "list_directory",
       "read_file",
+      "run_poc",
       "search_workspace",
       "test_status",
       "workspace_info",
+      "write_file",
+      "write_scope_info",
     ]);
-    // Fail CI if any public capability looks like filesystem mutation,
-    // command execution, package installation, or a Git write operation.
+    const mutable = tools.filter((tool) => tool.annotations?.readOnlyHint === false);
+    expect(mutable.map((tool) => tool.name).sort()).toEqual(["run_poc", "write_file"]);
+    for (const tool of mutable) {
+      expect(tool.annotations).toMatchObject({
+        destructiveHint: false,
+        openWorldHint: false,
+      });
+    }
+    expect(tools.find((tool) => tool.name === "write_scope_info")?.annotations?.readOnlyHint).toBe(true);
     const forbiddenCapabilities =
-      /(?:^|_)(?:write|delete|remove|move|rename|shell|exec|terminal|run_command|install|commit|push|checkout|merge|rebase|reset|stash|clean)(?:_|$)/i;
-    for (const name of names) {
+      /(?:^|_)(?:delete|remove|move|rename|shell|exec|terminal|run_command|install|commit|push|checkout|merge|rebase|reset|stash|clean)(?:_|$)/i;
+    for (const name of names.filter((name) => name !== "write_file" && name !== "run_poc")) {
       expect(name, `dangerous public MCP tool: ${name}`).not.toMatch(forbiddenCapabilities);
     }
 
     expectToolOutputSchema(tools, "workspace_info", ["workspaceId", "workspaceName", "projectType", "git"]);
     expectToolOutputSchema(tools, "list_directory", ["path", "entries", "total", "hasMore"]);
-    expectToolOutputSchema(tools, "read_file", ["path", "content", "startLine", "endLine", "nextStartLine"]);
+    expectToolOutputSchema(tools, "read_file", ["path", "sha256", "content", "startLine", "endLine", "nextStartLine"]);
     expectToolOutputSchema(tools, "search_workspace", ["matches", "matchCount", "truncated", "engine"]);
     expectToolOutputSchema(tools, "git_status", ["isRepo", "branch", "staged", "unstaged", "untracked", "hidden"]);
     expectToolOutputSchema(tools, "git_diff", ["isRepo", "mode", "diff", "hasMore", "nextOffset"]);
     expectToolOutputSchema(tools, "test_status", ["available", "tests", "outputAvailable", "outputId"]);
     expectToolOutputSchema(tools, "execution_summary", ["records"]);
     expectToolOutputSchema(tools, "execution_output", ["action", "items", "text"]);
+    expectToolOutputSchema(tools, "write_scope_info", ["active"]);
+    expectToolOutputSchema(tools, "write_file", ["path", "sha256", "created"]);
+    expectToolOutputSchema(tools, "run_poc", ["program", "args", "cwd", "exitCode"]);
   });
 
   it("documents git_diff pagination with its output field names", async () => {
@@ -130,8 +146,116 @@ describe("MCP tools over Streamable HTTP", () => {
 
   it("read_file returns hello.txt", async () => {
     const result = await client.callTool({ name: "read_file", arguments: { path: "hello.txt" } });
-    const file = structuredJsonOf<{ content: string; totalLines: number }>(result);
+    const file = structuredJsonOf<{ content: string; totalLines: number; sha256: string }>(result);
     expect(file.content).toContain("Hello from Codex with ChatGPT!");
+    expect(file.sha256).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("keeps mutable tools unavailable to the existing read-only Connector", async () => {
+    const scope = await client.callTool({ name: "write_scope_info", arguments: {} });
+    expect(structuredJsonOf<{ active: boolean }>(scope)).toEqual({ active: false });
+    for (const name of ["write_file", "run_poc"]) {
+      const result = await client.callTool({
+        name,
+        arguments:
+          name === "write_file"
+            ? { path: "docs/a.md", content: "x\n" }
+            : { program: "node", args: [] },
+      });
+      expect(result.isError).toBe(true);
+      expect(textOf(result)).toContain("INSUFFICIENT_SCOPE");
+    }
+  });
+
+  it("requires OAuth scope plus the local Writable Root for write_file", async () => {
+    fs.mkdirSync(path.join(root, "docs/research"), { recursive: true });
+    const info = await adminFetch<{ startedAt: string }>(
+      {
+        service: "c2c-bridge",
+        version: "test",
+        workspaceId: bridge.workspace.id,
+        workspaceRoot: bridge.workspace.root,
+        pid: process.pid,
+        port: bridge.port,
+        adminToken: bridge.adminToken,
+        publicUrl: null,
+        startedAt: "",
+      },
+      "GET",
+      "/admin/info"
+    );
+    setWriteScope({
+      workspaceId: bridge.workspace.id,
+      root: "docs/research",
+      mode: "write",
+      bridgeStartedAt: info.startedAt,
+    });
+    const tokens = bridge.authStore.issueTokens({
+      clientId: "write-client",
+      scopes: ["workspace.read", "workspace.write"],
+    });
+    const writeClient = new Client({ name: "write-client", version: "1.0.0" });
+    const transport = new StreamableHTTPClientTransport(new URL(`${bridge.localBaseUrl()}/mcp`), {
+      requestInit: { headers: { authorization: `Bearer ${tokens.accessToken}` } },
+    });
+    await writeClient.connect(transport);
+    try {
+      const created = await writeClient.callTool({
+        name: "write_file",
+        arguments: { path: "docs/research/a.md", content: "first\n" },
+      });
+      expect(structuredJsonOf<{ created: boolean }>(created).created).toBe(true);
+      const read = await writeClient.callTool({
+        name: "read_file",
+        arguments: { path: "docs/research/a.md" },
+      });
+      const file = structuredJsonOf<{ sha256: string }>(read);
+      const updated = await writeClient.callTool({
+        name: "write_file",
+        arguments: {
+          path: "docs/research/a.md",
+          content: "second\n",
+          expected_sha256: file.sha256,
+        },
+      });
+      expect(updated.isError).not.toBe(true);
+      const outside = await writeClient.callTool({
+        name: "write_file",
+        arguments: { path: "contracts/Evil.sol", content: "contract Evil {}\n" },
+      });
+      expect(textOf(outside)).toContain("WRITE_SCOPE_VIOLATION");
+    } finally {
+      await writeClient.close();
+      clearWriteScope(bridge.workspace.id);
+    }
+  });
+
+  it("rejects write_file when OAuth grants write but local Writable Scope is inactive", async () => {
+    const tokens = bridge.authStore.issueTokens({
+      clientId: "write-without-scope",
+      scopes: ["workspace.read", "workspace.write", "execution.poc"],
+    });
+    const writeClient = new Client({ name: "write-without-scope", version: "1.0.0" });
+    const transport = new StreamableHTTPClientTransport(new URL(`${bridge.localBaseUrl()}/mcp`), {
+      requestInit: { headers: { authorization: `Bearer ${tokens.accessToken}` } },
+    });
+    await writeClient.connect(transport);
+    try {
+      const read = await writeClient.callTool({ name: "read_file", arguments: { path: "hello.txt" } });
+      expect(read.isError ?? false).toBe(false);
+      const written = await writeClient.callTool({
+        name: "write_file",
+        arguments: { path: "docs/research/a.md", content: "x\n" },
+      });
+      expect(textOf(written)).toContain("WRITE_SCOPE_NOT_ACTIVE");
+      const poc = await writeClient.callTool({
+        name: "run_poc",
+        arguments: { program: "node", args: ["hello.txt"] },
+      });
+      expect(textOf(poc)).toContain("WRITE_SCOPE_NOT_ACTIVE");
+    } finally {
+      await writeClient.close();
+    }
   });
 
   it("read_file denies .env with ACCESS_DENIED_SENSITIVE_FILE and no content", async () => {
@@ -139,6 +263,9 @@ describe("MCP tools over Streamable HTTP", () => {
     expect(result.isError).toBe(true);
     expect(textOf(result)).toContain("ACCESS_DENIED_SENSITIVE_FILE");
     expect(textOf(result)).not.toContain("supersecret");
+    const nested = await client.callTool({ name: "read_file", arguments: { path: "foo/.env.local" } });
+    expect(nested.isError).toBe(true);
+    expect(textOf(nested)).not.toContain("never-return-this");
   });
 
   it("read_file denies paths outside the workspace", async () => {
@@ -160,6 +287,19 @@ describe("MCP tools over Streamable HTTP", () => {
     const result = await client.callTool({ name: "search_workspace", arguments: { query: "answer" } });
     const search = structuredJsonOf<{ matches: { path: string; line: number }[] }>(result);
     expect(search.matches.some((match) => match.path === "src/index.ts")).toBe(true);
+  });
+
+  it("never exposes env contents through search or listing", async () => {
+    const search = await client.callTool({
+      name: "search_workspace",
+      arguments: { query: "never-return-this", path: "." },
+    });
+    expect(textOf(search)).not.toContain("never-return-this");
+    const listing = await client.callTool({
+      name: "list_directory",
+      arguments: { path: ".", depth: 4, limit: 1000 },
+    });
+    expect(textOf(listing)).not.toContain(".env.local");
   });
 
   it("git_status reports the dirty file", async () => {

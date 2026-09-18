@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import { startBridge, type Bridge } from "../src/bridge/server.js";
+import { filterScopes } from "../src/auth/store.js";
 import { makeTmpDir, cleanup, write, isolateStateDir, pkceVerifierAndChallenge } from "./helpers.js";
 
 let root: string;
@@ -113,6 +114,22 @@ describe("discovery metadata", () => {
 });
 
 describe("authorization + token flow", () => {
+  it("keeps omitted OAuth scope read-only by default", () => {
+    expect(filterScopes(undefined)).toEqual([
+      "workspace.read",
+      "workspace.search",
+      "git.read",
+      "execution.read",
+      "offline_access",
+    ]);
+    expect(filterScopes(undefined)).not.toContain("workspace.write");
+    expect(filterScopes(undefined)).not.toContain("execution.poc");
+    expect(filterScopes("workspace.write execution.poc")).toEqual([
+      "workspace.write",
+      "execution.poc",
+    ]);
+  });
+
   it("completes the full pairing + PKCE flow and calls MCP", async () => {
     const clientId = await registerClient();
     const { verifier, challenge } = pkceVerifierAndChallenge();
@@ -265,7 +282,7 @@ describe("authorization + token flow", () => {
     authorizeUrl.searchParams.set("response_type", "code");
     authorizeUrl.searchParams.set("code_challenge", challenge);
     authorizeUrl.searchParams.set("code_challenge_method", "S256");
-    authorizeUrl.searchParams.set("scope", "workspace.write shell");
+    authorizeUrl.searchParams.set("scope", "shell sudo");
 
     const response = await fetch(authorizeUrl, { redirect: "manual" });
     expect(response.status).toBe(302);

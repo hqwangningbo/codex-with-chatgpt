@@ -5,7 +5,7 @@ ChatGPT
   │ official Connector + OAuth
   ▼
 C2C Bridge (loopback-only, public through Cloudflare HTTPS Tunnel)
-  │ read-only MCP
+  │ default-read-only MCP
   ▼
 Workspace
   ▲
@@ -20,7 +20,8 @@ There is no automated ChatGPT control plane and no conversation state.
 ## Components
 
 - `bridge/`: Express assembly, loopback listener, runtime state, local Admin API
-- `mcp/`: nine read-only tools over stateless Streamable HTTP
+- `mcp/`: read tools plus locally gated `write_file`/`run_poc` over stateless
+  Streamable HTTP
 - `auth/`: OAuth discovery, dynamic registration, authorization code + PKCE,
   refresh rotation, revocation, token hashes
 - `pairing/`: CSPRNG one-time code, TTL, attempt and per-IP limits
@@ -34,8 +35,11 @@ There is no automated ChatGPT control plane and no conversation state.
 
 ## Lifecycles
 
-MCP: ChatGPT → HTTPS Tunnel → `/mcp` → Bearer validation (401/403) → scope
-check → read-only handler → Workspace containment/filtering → bounded result.
+MCP: ChatGPT → HTTPS Tunnel → `/mcp` → Bearer validation (401/403) → OAuth
+scope check → handler → Workspace containment/filtering → bounded result.
+Mutable handlers additionally require a machine-local Writable Root bound to
+the current Bridge session. `run_poc` uses a macOS Seatbelt profile with no
+network and write access limited to that root.
 
 OAuth: protected-resource discovery → dynamic client registration →
 authorization + user-entered one-time pairing code → PKCE token exchange.

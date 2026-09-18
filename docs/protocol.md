@@ -3,7 +3,7 @@
 C2C has one automated data plane only:
 
 ```text
-ChatGPT → official Connector → OAuth → read-only MCP → Workspace
+ChatGPT → official Connector → OAuth → default-read-only MCP → Workspace
 ```
 
 There is no automated ChatGPT control plane. The user manually copies a short
@@ -37,7 +37,7 @@ c2c prompt plan -w <workspace> --task "<task>"
 ```
 
 The generated prompt asks ChatGPT to verify `workspace_info`, inspect only the
-necessary code through read-only tools, and return task understanding, files,
+necessary code through read tools, and return task understanding, files,
 implementation approach, security risks, and tests. C2C prints the prompt but
 never sends it.
 
@@ -79,4 +79,9 @@ returns the result to Codex.
   Connector mutation.
 - No code, diff, output body, token, pairing code, or MCP URL in generated
   prompts.
-- MCP remains read-only; only Codex can edit, execute, or perform Git writes.
+- OAuth grants remain read-only by default. `write_file` and sandboxed
+  `run_poc` require explicitly requested OAuth scopes plus a local,
+  session-bound Writable Root. ChatGPT cannot set or widen that root.
+- `.env`, every `.env.*`, and `.env.example` writes are permanently denied;
+  POC subprocesses cannot read or write them.
+- Only Codex can perform arbitrary shell, package, delete/rename, or Git writes.

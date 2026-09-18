@@ -49,6 +49,12 @@ import { PRODUCT_NAME, VERSION } from "../version.js";
 import { appendExecutionRecord } from "../execution/records.js";
 import { saveExecutionOutput } from "../execution/output.js";
 import { generatePlanPrompt, generateReviewPrompt, type PromptProfile } from "../prompt/generate.js";
+import {
+  clearWriteScope,
+  setWriteScope,
+  writeScopeInfo,
+  type WriteScopeMode,
+} from "../write-scope/state.js";
 
 const program = new Command();
 
@@ -60,6 +66,38 @@ const cross = (msg: string): void => say(`✗ ${msg}`);
 
 function resolveWorkspace(option?: string): string {
   return path.resolve(option ?? process.cwd());
+}
+
+function parseWriteScopeMode(value: string): WriteScopeMode {
+  if (value !== "write" && value !== "poc") {
+    throw new InvalidArgumentError("mode must be write or poc");
+  }
+  return value;
+}
+
+function resolveWritableRoot(workspace: Workspace, requested: string): string {
+  if (
+    path.isAbsolute(requested) ||
+    /^[a-zA-Z]:[\\/]/.test(requested) ||
+    requested.startsWith("\\\\")
+  ) {
+    throw new Error("WRITE_ROOT_MUST_BE_WORKSPACE_RELATIVE");
+  }
+  const normalized = requested.replace(/\\/g, "/");
+  if (normalized.split("/").includes("..")) {
+    throw new Error("WRITE_ROOT_MUST_BE_WORKSPACE_RELATIVE");
+  }
+  const resolved = workspace.resolve(normalized);
+  const lexical = path.resolve(workspace.root, normalized);
+  if (resolved.abs !== lexical) throw new Error("WRITE_ROOT_SYMLINK_NOT_ALLOWED");
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(resolved.abs);
+  } catch {
+    throw new Error("WRITE_ROOT_NOT_FOUND");
+  }
+  if (!stat.isDirectory()) throw new Error("WRITE_ROOT_NOT_DIRECTORY");
+  return resolved.rel || ".";
 }
 
 function parsePromptProfile(value: string): PromptProfile {
@@ -220,6 +258,7 @@ interface AdminInfo {
   pairingActive: boolean;
   pid: number;
   startedAt: string;
+  writeScope?: { active: boolean; root?: string; mode?: WriteScopeMode };
 }
 
 async function ensureBridgeAndTunnel(
@@ -420,6 +459,100 @@ program
     }
   });
 
+// ---------------------------------------------------------------- write-scope
+
+const writeScopeCommand = program
+  .command("write-scope")
+  .description("Manage the local, session-bound writable root");
+
+writeScopeCommand
+  .command("status")
+  .option("-w, --workspace <path>")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { workspace?: string; json: boolean }) => {
+    const workspace = new Workspace(resolveWorkspace(opts.workspace));
+    const observation = await findBridgeObservation(workspace.id);
+    const info =
+      observation.state === "healthy"
+        ? writeScopeInfo(workspace.id, observation.runtime.startedAt)
+        : { active: false as const };
+    if (opts.json) {
+      say(JSON.stringify({ ok: true, workspace: { id: workspace.id, name: workspace.name }, ...info }));
+      return;
+    }
+    say(`Workspace：${workspace.name}`);
+    say(info.active ? `Writable Root：${info.root}\nMode：${info.mode}` : "Writable Scope：inactive");
+  });
+
+writeScopeCommand
+  .command("set")
+  .requiredOption("--root <relative-directory>", "Workspace-relative writable directory")
+  .requiredOption("--mode <mode>", "write or poc", parseWriteScopeMode)
+  .option("-w, --workspace <path>")
+  .option("--allow-workspace-root", "explicitly allow root='.'", false)
+  .option("--yes", "confirm source-directory or workspace-root access", false)
+  .option("--json", "machine-readable output", false)
+  .action(
+    async (opts: {
+      root: string;
+      mode: WriteScopeMode;
+      workspace?: string;
+      allowWorkspaceRoot: boolean;
+      yes: boolean;
+      json: boolean;
+    }) => {
+      const workspace = new Workspace(resolveWorkspace(opts.workspace));
+      const root = resolveWritableRoot(workspace, opts.root);
+      if (root === "." && !opts.allowWorkspaceRoot) {
+        throw new Error("WORKSPACE_ROOT_REQUIRES_ALLOW_WORKSPACE_ROOT");
+      }
+      const sourceLike = root === "." || /^(?:src|contracts|packages|apps)(?:\/|$)/i.test(root);
+      if (sourceLike && !opts.yes) {
+        throw new Error(
+          root === "."
+            ? "WORKSPACE_ROOT_REQUIRES_CONFIRMATION"
+            : "SOURCE_WRITE_ROOT_REQUIRES_CONFIRMATION"
+        );
+      }
+      const observation = await findBridgeObservation(workspace.id);
+      if (observation.state !== "healthy") throw new Error("WRITE_SCOPE_BRIDGE_NOT_RUNNING");
+      const state = setWriteScope({
+        workspaceId: workspace.id,
+        root,
+        mode: opts.mode,
+        bridgeStartedAt: observation.runtime.startedAt,
+      });
+      const result = {
+        ok: true,
+        workspace: { id: workspace.id, name: workspace.name },
+        active: true,
+        root: state.root,
+        mode: state.mode,
+      };
+      if (opts.json) {
+        say(JSON.stringify(result));
+        return;
+      }
+      check(`Workspace：${workspace.name}`);
+      check(`Writable Root：${state.root}`);
+      check(`Mode：${state.mode}`);
+    }
+  );
+
+writeScopeCommand
+  .command("clear")
+  .option("-w, --workspace <path>")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { workspace?: string; json: boolean }) => {
+    const workspace = new Workspace(resolveWorkspace(opts.workspace));
+    clearWriteScope(workspace.id);
+    if (opts.json) {
+      say(JSON.stringify({ ok: true, workspace: { id: workspace.id, name: workspace.name }, active: false }));
+      return;
+    }
+    check(`已关闭 ${workspace.name} 的 Writable Scope`);
+  });
+
 // ---------------------------------------------------------------- stop / restart
 
 program
@@ -429,7 +562,12 @@ program
   .option("--json", "machine-readable output", false)
   .action(async (opts: { workspace?: string; json: boolean }) => {
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
-    const stopped = await stopBridge(workspace.root);
+    let stopped = false;
+    try {
+      stopped = await stopBridge(workspace.root);
+    } finally {
+      clearWriteScope(workspace.id);
+    }
     if (opts.json) {
       say(JSON.stringify({ ok: true, workspace: { id: workspace.id, name: workspace.name }, stopped }));
       return;
@@ -487,6 +625,7 @@ program
             hostname: configuredTunnel.hostname ?? null,
           },
           mcpUrl: null,
+          writeScope: { active: false },
           reason: observation.reason,
         }));
       } else {
@@ -509,6 +648,7 @@ program
             hostname: configuredTunnel.hostname ?? null,
           },
           mcpUrl: null,
+          writeScope: { active: false },
         }));
       } else {
         say(`Workspace：${workspace.name}`);
@@ -529,6 +669,7 @@ program
         bridge: { healthy: true, pid: info.pid, port: info.port },
         tunnel: { ...info.tunnel, verified: false },
         mcpUrl: info.tunnel.running && info.tunnel.url ? `${info.tunnel.url}/mcp` : null,
+        writeScope: info.writeScope ?? { active: false },
       }));
       return;
     }

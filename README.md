@@ -15,7 +15,7 @@ DeFi, and other high-value engineering work.
                │
         Official Connector
                │
-          Read-only MCP
+      Read-only by default MCP
                │
                ▼
 ┌─────────────────────────────┐
@@ -54,7 +54,7 @@ automation and an unnecessary attack surface from high-value code environments.
 Cloudflare account authorization for an optional named Tunnel remains a
 separate, explicit user action.
 
-## Read-only MCP tools
+## MCP tools
 
 The public MCP server exposes exactly:
 
@@ -67,9 +67,24 @@ The public MCP server exposes exactly:
 - `test_status`
 - `execution_summary`
 - `execution_output`
+- `write_scope_info` (read-only)
+- `write_file` (requires explicit OAuth scope + local Writable Root)
+- `run_poc` (requires explicit OAuth scope + local `poc` mode)
 
-There are no file-write, command-execution, package-installation, or Git-write
-tools. ChatGPT cannot modify the Workspace through C2C.
+The default OAuth grant remains read-only. Mutable tools stay unavailable until
+the user explicitly sets a session-bound, Workspace-relative Writable Root on
+the local machine. There is no arbitrary shell, package-installation, delete,
+rename, or Git-write tool. `.env`, every `.env.*`, and `.env.example` writes
+are permanently denied.
+
+```bash
+c2c write-scope set -w <workspace> --root docs/research --mode write
+c2c write-scope status -w <workspace>
+c2c write-scope clear -w <workspace>
+```
+
+Source directories require `--yes`; root `.` additionally requires
+`--allow-workspace-root`. `c2c stop` clears the active scope.
 
 ## Security-first installation
 
