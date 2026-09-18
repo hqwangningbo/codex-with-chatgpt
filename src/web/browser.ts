@@ -71,8 +71,6 @@ export async function launchWebContext(input: {
     executablePath,
     headless: false,
     viewport: { width: 1280, height: 900 },
-    args: ["--disable-blink-features=AutomationControlled"],
-    ignoreDefaultArgs: ["--enable-automation"],
   });
   context.setDefaultTimeout(30_000);
   context.on("page", (page) => {

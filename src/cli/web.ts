@@ -3,7 +3,13 @@ import { Workspace } from "../workspace/manager.js";
 import { findBridgeObservation } from "../bridge/runtime.js";
 import { WebError } from "../web/errors.js";
 import { clearWebProfile, webProfileExists, webProfileDir } from "../web/profile.js";
-import { activeWebTask, clearWebRuntime, markWebInterrupted, readWebRuntime } from "../web/state.js";
+import {
+  activeWebTask,
+  clearWebRuntime,
+  observeWebTask,
+  readWebRuntime,
+  stopWebTask,
+} from "../web/state.js";
 
 interface CliHelpers {
   say: (msg: string) => void;
@@ -21,6 +27,10 @@ function pidAlive(pid: number | null): boolean {
   } catch {
     return false;
   }
+}
+
+function statusAuthenticated(): false | "unknown" {
+  return webProfileExists() ? "unknown" : false;
 }
 
 export function registerWebCommands(program: Command, helpers: CliHelpers): void {
@@ -60,11 +70,12 @@ export function registerWebCommands(program: Command, helpers: CliHelpers): void
       .option("--json", "machine-readable output", false)
   ).action((opts: { json: boolean }) => {
     const runtime = readWebRuntime();
-    const task = activeWebTask();
+    const observation = observeWebTask();
+    const task = observation.state === "running" ? observation.runtime : null;
     const payload = {
       ok: true,
       profileExists: webProfileExists(),
-      authenticated: webProfileExists(),
+      authenticated: statusAuthenticated(),
       browserRunning: Boolean(task && pidAlive(task.pid)),
       activeResearchTask: task
         ? { requestId: task.requestId, workspaceId: task.workspaceId, stepCount: task.stepCount, status: task.status }
@@ -159,18 +170,13 @@ export function registerWebCommands(program: Command, helpers: CliHelpers): void
       .description("Stop the Web Research Harness without touching Bridge or Tunnel")
       .option("--json", "machine-readable output", false)
   ).action((opts: { json: boolean }) => {
-    const task = activeWebTask();
-    if (task?.pid && task.pid !== process.pid) {
-      try {
-        process.kill(task.pid, "SIGTERM");
-      } catch {
-        // Already gone.
-      }
+    try {
+      const payload = stopWebTask();
+      if (opts.json) say(JSON.stringify(payload));
+      else check("Web Research Harness 已停止");
+    } catch (error) {
+      handleCliError(error, opts.json);
     }
-    markWebInterrupted();
-    const payload = { ok: true, stopped: true };
-    if (opts.json) say(JSON.stringify(payload));
-    else check("Web Research Harness 已停止");
   });
 
   acceptUnusedWorkspaceOption(
@@ -185,6 +191,9 @@ export function registerWebCommands(program: Command, helpers: CliHelpers): void
         throw new WebError("WEB_LOGOUT_REQUIRES_YES", "Pass --yes to delete the C2C Browser Profile");
       }
       if (activeWebTask()) throw new WebError("WEB_RESEARCH_BUSY", "Stop the research task before logout");
+      if (observeWebTask().state === "unknown") {
+        throw new WebError("WEB_STOP_PID_UNCERTAIN", "A recorded PID is live but unproven; refusing to delete the profile");
+      }
       clearWebProfile();
       clearWebRuntime();
       if (opts.json) say(JSON.stringify({ ok: true, profileExists: false, profileDir: webProfileDir() }));

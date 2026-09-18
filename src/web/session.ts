@@ -7,6 +7,8 @@ import {
   classifyPage,
   extractChatGptSnapshot,
   sessionIsReady,
+  sendBaselineFrom,
+  uniqueIds,
   watchSentTurn,
   type ChatGptSnapshot,
   SELECTORS,
@@ -101,7 +103,21 @@ export class PlaywrightChatSession implements ChatSession {
     this.sendGuard.assertCanSend();
     const before = await this.snapshot();
     if (!sessionIsReady(before)) failFromSnapshot(before);
-    const baseline = before.assistantTurnIds;
+    const baselineContainers = uniqueIds(before.turnContainerIds);
+    if (!baselineContainers.ok && before.turnContainerIds.length > 0) {
+      throw new WebError(
+        baselineContainers.reason === "duplicate" ? "WEB_TURN_AMBIGUOUS" : "WEB_TURN_STATE_UNKNOWN",
+        "ChatGPT turn containers were not unique before send; refusing to send"
+      );
+    }
+    const baselineAssistants = uniqueIds(before.assistantTurnIds);
+    if (!baselineAssistants.ok && before.assistantTurnIds.length > 0) {
+      throw new WebError(
+        baselineAssistants.reason === "duplicate" ? "WEB_TURN_AMBIGUOUS" : "WEB_TURN_STATE_UNKNOWN",
+        "ChatGPT assistant turns were not unique before send; refusing to send"
+      );
+    }
+    const baseline = sendBaselineFrom(before);
     const composer = this.page.locator(SELECTORS.composer).first();
     await composer.click();
     await composer.fill(text);

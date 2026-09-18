@@ -15,7 +15,7 @@ import {
 } from "./protocol.js";
 import { researchContractPrompt } from "./prompt.js";
 import type { ChatSession } from "./session.js";
-import { activeWebTask, writeWebRuntime } from "./state.js";
+import { activeWebTask, observeWebTask, writeWebRuntime } from "./state.js";
 
 export interface ResearchInput {
   workspace: Workspace;
@@ -39,6 +39,10 @@ const DEFAULT_MAX_STEPS = 30;
 const HARD_MAX_STEPS = 60;
 
 export async function runResearchTurn(input: ResearchInput): Promise<ResearchResult> {
+  const observation = observeWebTask();
+  if (observation.state === "unknown") {
+    throw new WebError("WEB_STOP_PID_UNCERTAIN", "A recorded PID is live but unproven; refusing to start another research task");
+  }
   const busy = activeWebTask();
   if (busy && busy.pid !== process.pid) {
     throw new WebError("WEB_RESEARCH_BUSY", "A Web Research task is already running");

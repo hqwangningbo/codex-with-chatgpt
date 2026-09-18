@@ -1,13 +1,20 @@
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { SendGuard } from "../src/web/send-guard.js";
 import { WebError } from "../src/web/errors.js";
 import {
   classifyPage,
+  isTemporaryChatProven,
   sessionIsReady,
   watchSentTurn,
   type ChatGptSnapshot,
+  type SendBaseline,
 } from "../src/web/selectors.js";
 import { resolveBrowserExecutable } from "../src/web/browser.js";
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 function snapshot(over: Partial<ChatGptSnapshot> = {}): ChatGptSnapshot {
   return {
@@ -17,6 +24,7 @@ function snapshot(over: Partial<ChatGptSnapshot> = {}): ChatGptSnapshot {
     composerDisabled: false,
     profilePresent: true,
     temporaryChat: true,
+    temporaryTogglePressed: false,
     loginSurface: false,
     challenge: false,
     rateLimit: false,
@@ -24,11 +32,16 @@ function snapshot(over: Partial<ChatGptSnapshot> = {}): ChatGptSnapshot {
     turnContainerIds: [],
     userTurnIds: [],
     assistantTurnIds: [],
+    assistantIdByContainer: {},
     stopVisible: false,
     streaming: false,
     assistantTextById: {},
     ...over,
   };
+}
+
+function baseline(over: Partial<SendBaseline> = {}): SendBaseline {
+  return { assistantTurnIds: [], turnContainerIds: [], ...over };
 }
 
 describe("ChatGPT page fixtures", () => {
@@ -37,7 +50,45 @@ describe("ChatGPT page fixtures", () => {
     expect(sessionIsReady(snapshot())).toBe(true);
     expect(sessionIsReady(snapshot({ composerCount: 0 }))).toBe(false);
     expect(sessionIsReady(snapshot({ composerDisabled: true }))).toBe(false);
-    expect(sessionIsReady(snapshot({ temporaryChat: false }))).toBe(false);
+    expect(
+      sessionIsReady(
+        snapshot({
+          href: "https://chatgpt.com/",
+          temporaryChat: false,
+          temporaryTogglePressed: false,
+        })
+      )
+    ).toBe(false);
+  });
+
+  it("proves Temporary Chat only from the URL or an explicit pressed toggle", () => {
+    expect(isTemporaryChatProven(snapshot())).toBe(true);
+    expect(
+      isTemporaryChatProven(
+        snapshot({
+          href: "https://chatgpt.com/",
+          temporaryChat: true,
+          temporaryTogglePressed: false,
+        })
+      )
+    ).toBe(false);
+    expect(
+      isTemporaryChatProven(
+        snapshot({
+          href: "https://chatgpt.com/",
+          temporaryTogglePressed: true,
+        })
+      )
+    ).toBe(true);
+    expect(
+      sessionIsReady(
+        snapshot({
+          href: "https://chatgpt.com/",
+          temporaryChat: true,
+          temporaryTogglePressed: false,
+        })
+      )
+    ).toBe(false);
   });
 
   it("fail-closes CAPTCHA, rate-limit, and UI drift", () => {
@@ -46,13 +97,15 @@ describe("ChatGPT page fixtures", () => {
     expect(classifyPage(snapshot({ origin: "https://example.com", href: "https://example.com/" }))).toBe("drift");
   });
 
-  it("waits through streaming and remounts, and rejects duplicate turn ids", () => {
-    const baseline = ["old-turn"];
+  it("binds completion to a unique new logical container, not a remounted assistant", () => {
+    const before = baseline({ assistantTurnIds: ["old-turn"], turnContainerIds: ["c-old", "c-hidden"] });
     expect(
       watchSentTurn(
-        baseline,
+        before,
         snapshot({
+          turnContainerIds: ["c-old", "c-hidden", "c-new"],
           assistantTurnIds: ["old-turn", "new-turn"],
+          assistantIdByContainer: { "c-old": "old-turn", "c-new": "new-turn" },
           streaming: true,
           assistantTextById: { "new-turn": "partial" },
         })
@@ -60,44 +113,117 @@ describe("ChatGPT page fixtures", () => {
     ).toBe("waiting");
     expect(
       watchSentTurn(
-        baseline,
+        before,
         snapshot({
+          turnContainerIds: ["c-old", "c-hidden", "c-new"],
           assistantTurnIds: ["old-turn", "new-turn"],
-          stopVisible: true,
-          assistantTextById: { "new-turn": "almost" },
-        })
-      ).status
-    ).toBe("waiting");
-    expect(
-      watchSentTurn(
-        baseline,
-        snapshot({
-          assistantTurnIds: ["new-turn"],
+          assistantIdByContainer: { "c-old": "old-turn", "c-new": "new-turn" },
           assistantTextById: { "new-turn": "final answer" },
         })
       )
     ).toMatchObject({ status: "complete", id: "new-turn", text: "final answer" });
+  });
+
+  it("does not treat a virtualized old assistant remount as this send's reply", () => {
+    const before = baseline({ assistantTurnIds: ["visible-old"], turnContainerIds: ["c-visible", "c-hidden"] });
+    const remounted = watchSentTurn(
+      before,
+      snapshot({
+        turnContainerIds: ["c-visible", "c-hidden"],
+        assistantTurnIds: ["visible-old", "hidden-old"],
+        assistantIdByContainer: { "c-visible": "visible-old", "c-hidden": "hidden-old" },
+        assistantTextById: {
+          "visible-old": "old visible",
+          "hidden-old": "<C2C_ACTION>{\"type\":\"final\",\"summary\":\"stale\"}</C2C_ACTION>",
+        },
+      })
+    );
+    expect(remounted.status).toBe("waiting");
+  });
+
+  it("does not treat DOM reorder or remount of the same containers as a new action", () => {
+    const before = baseline({ assistantTurnIds: ["a", "b"], turnContainerIds: ["c-a", "c-b"] });
     expect(
       watchSentTurn(
-        baseline,
+        before,
         snapshot({
-          assistantTurnIds: ["old-turn", "new-turn", "new-turn"],
-          assistantTextById: { "new-turn": "dup" },
+          turnContainerIds: ["c-b", "c-a"],
+          assistantTurnIds: ["b", "a"],
+          assistantIdByContainer: { "c-a": "a", "c-b": "b" },
+          assistantTextById: { a: "one", b: "two" },
+        })
+      ).status
+    ).toBe("waiting");
+  });
+
+  it("fail-closes when a unique new assistant turn cannot be proven", () => {
+    const before = baseline({ assistantTurnIds: ["old-turn"], turnContainerIds: ["c-old"] });
+    expect(
+      watchSentTurn(
+        before,
+        snapshot({
+          turnContainerIds: ["c-old", "c-new", "c-new"],
+          assistantTurnIds: ["old-turn", "new-turn"],
+          assistantIdByContainer: { "c-old": "old-turn", "c-new": "new-turn" },
+          assistantTextById: { "new-turn": "dup container" },
         })
       )
     ).toMatchObject({ status: "fail", code: "WEB_TURN_AMBIGUOUS" });
-    expect(watchSentTurn(baseline, snapshot({ assistantTurnIds: ["old-turn"] })).status).toBe("waiting");
+    expect(
+      watchSentTurn(
+        before,
+        snapshot({
+          turnContainerIds: ["c-old", "c-new-1", "c-new-2"],
+          assistantTurnIds: ["old-turn", "n1", "n2"],
+          assistantIdByContainer: { "c-old": "old-turn", "c-new-1": "n1", "c-new-2": "n2" },
+          assistantTextById: { n1: "one", n2: "two" },
+        })
+      )
+    ).toMatchObject({ status: "fail", code: "WEB_TURN_AMBIGUOUS" });
+    expect(
+      watchSentTurn(
+        before,
+        snapshot({
+          turnContainerIds: ["c-old", ""],
+          assistantTurnIds: ["old-turn", "new-turn"],
+          assistantIdByContainer: { "c-old": "old-turn" },
+          assistantTextById: { "new-turn": "missing container id" },
+        })
+      )
+    ).toMatchObject({ status: "fail", code: "WEB_TURN_STATE_UNKNOWN" });
+    expect(
+      watchSentTurn(
+        before,
+        snapshot({
+          turnContainerIds: ["c-old", "c-new"],
+          assistantTurnIds: ["old-turn", "old-turn"],
+          assistantIdByContainer: { "c-new": "old-turn" },
+          assistantTextById: { "old-turn": "moved" },
+        })
+      )
+    ).toMatchObject({ status: "fail", code: "WEB_TURN_AMBIGUOUS" });
+    expect(
+      watchSentTurn(
+        before,
+        snapshot({
+          turnContainerIds: ["c-old", "c-new"],
+          assistantTurnIds: ["old-turn"],
+          assistantIdByContainer: { "c-new": "old-turn" },
+          assistantTextById: { "old-turn": "same id in new container" },
+        })
+      )
+    ).toMatchObject({ status: "fail", code: "WEB_TURN_STATE_UNKNOWN" });
   });
 
   it("treats login or drift after send as WEB_TURN_STATE_UNKNOWN", () => {
     expect(
       watchSentTurn(
-        [],
+        baseline(),
         snapshot({ href: "https://chatgpt.com/auth/login", loginSurface: true })
       )
     ).toMatchObject({ status: "fail", code: "WEB_TURN_STATE_UNKNOWN" });
     expect(
-      watchSentTurn([], snapshot({ origin: "https://evil.example", href: "https://evil.example/" }))
+      watchSentTurn(baseline(), snapshot({ origin: "https://evil.example", href: "https://evil.example/" }))
     ).toMatchObject({ status: "fail", code: "WEB_TURN_STATE_UNKNOWN" });
   });
 });
@@ -129,5 +255,20 @@ describe("browser executable policy", () => {
       if (previous === undefined) delete process.env.C2C_BROWSER_PATH;
       else process.env.C2C_BROWSER_PATH = previous;
     }
+  });
+
+  it("does not hide Playwright automation identity", () => {
+    const source = fs.readFileSync(path.join(root, "src/web/browser.ts"), "utf8");
+    expect(source).not.toContain("AutomationControlled");
+    expect(source).not.toContain("ignoreDefaultArgs");
+    expect(source).not.toContain("disable-blink-features");
+  });
+});
+
+describe("Temporary Chat extractor contract", () => {
+  it("does not treat Temporary button text as proof", () => {
+    const source = fs.readFileSync(path.join(root, "src/web/selectors.ts"), "utf8");
+    expect(source).not.toMatch(/temporary\/i\.test\(\s*el\.textContent/);
+    expect(source).not.toContain("el.textContent ?? \"\"");
   });
 });

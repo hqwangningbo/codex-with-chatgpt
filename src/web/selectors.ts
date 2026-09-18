@@ -27,6 +27,7 @@ export interface ChatGptSnapshot {
   composerDisabled: boolean;
   profilePresent: boolean;
   temporaryChat: boolean;
+  temporaryTogglePressed: boolean;
   loginSurface: boolean;
   challenge: boolean;
   rateLimit: boolean;
@@ -34,6 +35,7 @@ export interface ChatGptSnapshot {
   turnContainerIds: string[];
   userTurnIds: string[];
   assistantTurnIds: string[];
+  assistantIdByContainer: Record<string, string>;
   stopVisible: boolean;
   streaming: boolean;
   assistantTextById: Record<string, string>;
@@ -66,9 +68,19 @@ export function sessionIsReady(snapshot: ChatGptSnapshot): boolean {
     snapshot.composerCount === 1 &&
     !snapshot.composerDisabled &&
     snapshot.profilePresent &&
-    snapshot.temporaryChat &&
+    isTemporaryChatProven(snapshot) &&
     !snapshot.loginSurface
   );
+}
+
+/** Temporary Chat must be proven by URL or an explicit pressed toggle, not button text. */
+export function isTemporaryChatProven(snapshot: Pick<ChatGptSnapshot, "href" | "temporaryTogglePressed">): boolean {
+  try {
+    if (new URL(snapshot.href).searchParams.get("temporary-chat") === "true") return true;
+  } catch {
+    return false;
+  }
+  return snapshot.temporaryTogglePressed === true;
 }
 
 export function uniqueIds(values: string[]): { ok: true; ids: string[] } | { ok: false; reason: "missing" | "duplicate" } {
@@ -100,6 +112,11 @@ export function turnLooksComplete(snapshot: ChatGptSnapshot, assistantId: string
   return text.trim().length > 0;
 }
 
+export interface SendBaseline {
+  assistantTurnIds: string[];
+  turnContainerIds: string[];
+}
+
 export type SentTurnWatch =
   | { status: "waiting" }
   | { status: "complete"; id: string; text: string }
@@ -108,25 +125,65 @@ export type SentTurnWatch =
       code: "WEB_TURN_AMBIGUOUS" | "WEB_TURN_STATE_UNKNOWN" | "WEB_CHALLENGE" | "WEB_RATE_LIMIT";
     };
 
+export function sendBaselineFrom(snapshot: ChatGptSnapshot): SendBaseline {
+  return {
+    assistantTurnIds: snapshot.assistantTurnIds,
+    turnContainerIds: snapshot.turnContainerIds,
+  };
+}
+
 /**
- * After a send click, decide whether the unique new assistant turn is complete.
- * Login/drift after send is WEB_TURN_STATE_UNKNOWN so the caller must not resend.
+ * After a send click, bind the reply to a unique new logical container.
+ * Visible assistant remounts of old containers are not this send's response.
  */
-export function watchSentTurn(baseline: string[], snapshot: ChatGptSnapshot): SentTurnWatch {
+export function watchSentTurn(baseline: SendBaseline, snapshot: ChatGptSnapshot): SentTurnWatch {
   const kind = classifyPage(snapshot);
   if (kind === "challenge") return { status: "fail", code: "WEB_CHALLENGE" };
   if (kind === "rate_limit" || kind === "usage_limit") return { status: "fail", code: "WEB_RATE_LIMIT" };
   if (kind === "login" || kind === "drift") return { status: "fail", code: "WEB_TURN_STATE_UNKNOWN" };
-  const resolved = resolveNewAssistantTurn(baseline, snapshot.assistantTurnIds);
-  if (!resolved.ok && (resolved.reason === "duplicate" || resolved.reason === "ambiguous")) {
-    return { status: "fail", code: "WEB_TURN_AMBIGUOUS" };
+
+  const containers = uniqueIds(snapshot.turnContainerIds);
+  if (!containers.ok) {
+    if (snapshot.turnContainerIds.length === 0) return { status: "waiting" };
+    return {
+      status: "fail",
+      code: containers.reason === "duplicate" ? "WEB_TURN_AMBIGUOUS" : "WEB_TURN_STATE_UNKNOWN",
+    };
   }
-  if (!resolved.ok) return { status: "waiting" };
-  if (!turnLooksComplete(snapshot, resolved.id)) return { status: "waiting" };
+  const assistants = uniqueIds(snapshot.assistantTurnIds);
+  if (!assistants.ok && snapshot.assistantTurnIds.length > 0) {
+    return {
+      status: "fail",
+      code: assistants.reason === "duplicate" ? "WEB_TURN_AMBIGUOUS" : "WEB_TURN_STATE_UNKNOWN",
+    };
+  }
+
+  const newContainers = newLogicalIds(baseline.turnContainerIds, containers.ids);
+  const newAssistants = assistants.ok ? newLogicalIds(baseline.assistantTurnIds, assistants.ids) : [];
+
+  if (newAssistants.length > 0 && newContainers.length === 0) {
+    return { status: "waiting" };
+  }
+  if (newContainers.length === 0) return { status: "waiting" };
+
+  const bound: { containerId: string; assistantId: string }[] = [];
+  for (const containerId of newContainers) {
+    const assistantId = snapshot.assistantIdByContainer[containerId];
+    if (assistantId) bound.push({ containerId, assistantId });
+  }
+  if (bound.length === 0) return { status: "waiting" };
+  if (bound.length > 1) return { status: "fail", code: "WEB_TURN_AMBIGUOUS" };
+
+  const assistantId = bound[0].assistantId;
+  if (baseline.assistantTurnIds.includes(assistantId)) {
+    return { status: "fail", code: "WEB_TURN_STATE_UNKNOWN" };
+  }
+  if (!assistants.ok || !assistants.ids.includes(assistantId)) return { status: "waiting" };
+  if (!turnLooksComplete(snapshot, assistantId)) return { status: "waiting" };
   return {
     status: "complete",
-    id: resolved.id,
-    text: snapshot.assistantTextById[resolved.id] ?? "",
+    id: assistantId,
+    text: snapshot.assistantTextById[assistantId] ?? "",
   };
 }
 
@@ -164,18 +221,31 @@ export function extractChatGptSnapshot(): ChatGptSnapshot {
     const node = el as HTMLElement;
     return node.getAttribute("aria-disabled") === "true" || node.getAttribute("contenteditable") === "false";
   });
+  const assistantIdByContainer: Record<string, string> = {};
+  for (const container of containers) {
+    const containerId = container.getAttribute("data-turn-id-container") ?? "";
+    const assistant = container.querySelector('[data-message-author-role="assistant"][data-turn-id], [data-turn="assistant"][data-turn-id]');
+    const assistantId = assistant?.getAttribute("data-turn-id") ?? "";
+    if (containerId && assistantId) assistantIdByContainer[containerId] = assistantId;
+  }
+  let temporaryFromUrl = false;
+  try {
+    temporaryFromUrl = new URL(href).searchParams.get("temporary-chat") === "true";
+  } catch {
+    temporaryFromUrl = false;
+  }
+  const temporaryTogglePressed = [...document.querySelectorAll('[data-testid="temporary-chat-toggle"], button[aria-label*="Temporary" i], button[aria-label*="临时" i]')].some((el) => {
+    const pressed = el.getAttribute("aria-pressed") ?? el.getAttribute("aria-checked");
+    return pressed === "true";
+  });
   return {
     href,
     origin: location.origin,
     composerCount: composers.length,
     composerDisabled: disabled,
     profilePresent: [...document.querySelectorAll('[data-testid="profile-button"], button[aria-label="Open profile menu"], button[aria-label="打开个人资料菜单"]')].some(visible),
-    temporaryChat:
-      /temporary-chat=true/i.test(href) ||
-      [...document.querySelectorAll('button[aria-label*="Temporary" i], button[aria-label*="临时" i], [data-testid="temporary-chat-toggle"]')].some((el) => {
-        const pressed = el.getAttribute("aria-pressed") ?? el.getAttribute("aria-checked");
-        return pressed === "true" || /temporary/i.test(el.textContent ?? "");
-      }),
+    temporaryChat: temporaryFromUrl || temporaryTogglePressed,
+    temporaryTogglePressed,
     loginSurface: /\/auth\/|\/log-in|\/login(?:\/|$|\?)/i.test(href),
     challenge:
       /cf-challenge|captcha|human verification|verify you are human|cloudflare/i.test(body) ||
@@ -185,6 +255,7 @@ export function extractChatGptSnapshot(): ChatGptSnapshot {
     turnContainerIds: containers.map((el) => el.getAttribute("data-turn-id-container") ?? ""),
     userTurnIds: ids('[data-message-author-role="user"][data-turn-id], [data-turn="user"][data-turn-id]', "data-turn-id"),
     assistantTurnIds: assistantTurns.map((el) => el.getAttribute("data-turn-id") ?? ""),
+    assistantIdByContainer,
     stopVisible: [...document.querySelectorAll('button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="停止生成"]')].some(visible),
     streaming: Boolean(document.querySelector('[data-streaming-response-status], [data-state="streaming"]')),
     assistantTextById,

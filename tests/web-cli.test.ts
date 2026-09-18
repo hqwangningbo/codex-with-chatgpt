@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,6 +9,7 @@ import { Workspace } from "../src/workspace/manager.js";
 import type { ChatSession } from "../src/web/session.js";
 import type { ChatGptSnapshot } from "../src/web/selectors.js";
 import { ACTION_CLOSE, ACTION_OPEN, WEB_PROTOCOL } from "../src/web/protocol.js";
+import { inspectProcess, readWebRuntime, writeWebRuntime } from "../src/web/state.js";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const cliEntry = path.join(projectRoot, "src/cli/index.ts");
@@ -43,12 +44,21 @@ describe("web CLI isolation", () => {
     expect(fs.existsSync(path.join(stateDir, "web-profile"))).toBe(false);
     const status = JSON.parse(runCli(["web", "status", "--json"]).stdout) as {
       profileExists: boolean;
-      authenticated: boolean;
+      authenticated: boolean | "unknown";
       browserRunning: boolean;
     };
     expect(status.profileExists).toBe(false);
     expect(status.authenticated).toBe(false);
     expect(status.browserRunning).toBe(false);
+
+    fs.mkdirSync(path.join(stateDir, "web-profile"), { mode: 0o700 });
+    const withProfile = JSON.parse(runCli(["web", "status", "--json"]).stdout) as {
+      profileExists: boolean;
+      authenticated: boolean | "unknown";
+    };
+    expect(withProfile.profileExists).toBe(true);
+    expect(withProfile.authenticated).toBe("unknown");
+    fs.rmSync(path.join(stateDir, "web-profile"), { recursive: true, force: true });
   });
 
   it("rejects non-current models and missing profiles without launching a browser", () => {
@@ -84,6 +94,65 @@ describe("web CLI isolation", () => {
   });
 });
 
+describe("web stop PID identity", () => {
+  it("clears stale runtime with a dead PID without signaling", () => {
+    process.env.C2C_STATE_DIR = stateDir;
+    writeWebRuntime({
+      pid: 999_999_999,
+      requestId: "c2c_wr_dead",
+      workspaceId: "ws",
+      startedAt: new Date().toISOString(),
+      processStartedAt: "Mon Jan  1 00:00:00 2000",
+      command: `${process.execPath} src/cli/index.ts web research --task x`,
+      stepCount: 1,
+      status: "running",
+    });
+    const stopped = runCli(["web", "stop", "--json"]);
+    expect(stopped.status, stopped.stderr || stopped.stdout).toBe(0);
+    expect(JSON.parse(stopped.stdout)).toMatchObject({ ok: true, stopped: true, stale: true });
+    expect(readWebRuntime().status).toBe("interrupted");
+    expect(readWebRuntime().pid).toBeNull();
+  });
+
+  it("does not kill an unrelated live PID reused by stale runtime", () => {
+    process.env.C2C_STATE_DIR = stateDir;
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      stdio: "ignore",
+      detached: true,
+    });
+    child.unref();
+    try {
+      if (!child.pid) throw new Error("failed to spawn helper");
+      const live = inspectProcess(child.pid);
+      expect(live.alive).toBe(true);
+      writeWebRuntime({
+        pid: child.pid,
+        requestId: "c2c_wr_reused",
+        workspaceId: "ws",
+        startedAt: new Date().toISOString(),
+        processStartedAt: live.startedAt,
+        command: `${process.execPath} src/cli/index.ts web research --task reused`,
+        stepCount: 1,
+        status: "running",
+      });
+      const stopped = runCli(["web", "stop", "--json"]);
+      expect(stopped.status).not.toBe(0);
+      expect(stopped.stdout).toMatch(/WEB_STOP_PID_UNCERTAIN/);
+      expect(() => process.kill(child.pid!, 0)).not.toThrow();
+      expect(readWebRuntime().status).toBe("running");
+      expect(readWebRuntime().pid).toBe(child.pid);
+    } finally {
+      if (child.pid) {
+        try {
+          process.kill(child.pid, "SIGKILL");
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+  });
+});
+
 class FakeSession implements ChatSession {
   sent: string[] = [];
   async snapshot(): Promise<ChatGptSnapshot> {
@@ -97,6 +166,7 @@ class FakeSession implements ChatSession {
       composerDisabled: false,
       profilePresent: true,
       temporaryChat: true,
+      temporaryTogglePressed: false,
       loginSurface: false,
       challenge: false,
       rateLimit: false,
@@ -104,6 +174,7 @@ class FakeSession implements ChatSession {
       turnContainerIds: [],
       userTurnIds: [],
       assistantTurnIds: [],
+      assistantIdByContainer: {},
       stopVisible: false,
       streaming: false,
       assistantTextById: {},
