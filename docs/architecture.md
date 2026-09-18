@@ -31,7 +31,11 @@ There is no automated ChatGPT control plane and no conversation state.
 - `execution/`: concise records and optional sanitized output
 - `prompt/`: local plan/review text generation; no sending or receiving
 - `process/`: Bridge lifecycle and health checks
-- `cli/`: setup, pairing, prompt generation, diagnostics, and local recording
+- `cli/`: setup, pairing, prompt generation, diagnostics, local recording, and
+  the optional `c2c web` Research Harness
+- `web/`: dedicated ChatGPT Web profile, Temporary Chat session, local
+  dispatcher, and fail-closed UI handling. Playwright is loaded only when a
+  `c2c web` command runs.
 
 ## Lifecycles
 

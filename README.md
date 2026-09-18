@@ -49,8 +49,9 @@ Git, Foundry, and test ownership.
 - Create or restore Chats/Projects
 - Store ChatGPT conversation URLs
 
-Manual Safe Mode is the default and only recommended mode. This removes account
-automation and an unnecessary attack surface from high-value code environments.
+Those constraints apply to Manual Safe Mode, which remains the default
+Connector path. An optional `c2c web` Research Harness can drive the visible
+chatgpt.com UI after an explicit command; `c2c start` never launches it.
 Cloudflare account authorization for an optional named Tunnel remains a
 separate, explicit user action.
 
@@ -85,6 +86,24 @@ c2c write-scope clear -w <workspace>
 
 Source directories require `--yes`; root `.` additionally requires
 `--allow-workspace-root`. `c2c stop` clears the active scope.
+
+## Optional Web Research Harness
+
+`c2c web` is opt-in. ChatGPT Web (the user's own chatgpt.com session) is the
+reasoning model; C2C is the local capability boundary. It does not use Codex
+models, the OpenAI API, ChatGPT API keys, or private ChatGPT endpoints.
+
+```bash
+c2c web login
+c2c web research -w /path/to/project --task "..." --model current
+c2c web status
+c2c web stop
+c2c web logout --yes
+```
+
+Login uses a dedicated 0700 browser profile under the C2C state directory.
+Writable Scope and `.env` policy still apply. The Harness never writes Git
+history and never starts or stops Bridge/Tunnel.
 
 ## Security-first installation
 

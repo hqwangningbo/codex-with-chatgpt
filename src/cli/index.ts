@@ -55,6 +55,7 @@ import {
   writeScopeInfo,
   type WriteScopeMode,
 } from "../write-scope/state.js";
+import { registerWebCommands } from "./web.js";
 
 const program = new Command();
 
@@ -1410,10 +1411,19 @@ acceptUnusedWorkspaceOption(
     }
   });
 
+registerWebCommands(program, {
+  say,
+  check,
+  resolveWorkspace,
+  handleCliError,
+  acceptUnusedWorkspaceOption,
+});
+
 function handleCliError(error: unknown, json: boolean): void {
   const message = error instanceof Error ? error.message : String(error);
+  const code = error && typeof error === "object" && "code" in error ? String((error as { code: unknown }).code) : "";
   if (json) {
-    say(JSON.stringify({ ok: false, error: message }));
+    say(JSON.stringify({ ok: false, error: code ? `${code}: ${message}` : message }));
   } else if (message.startsWith("NEED_CLOUDFLARED")) {
     say("需要你完成一步：");
     say("");

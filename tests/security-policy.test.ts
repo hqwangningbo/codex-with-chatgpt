@@ -75,9 +75,10 @@ describe("secure operational policy", () => {
     expect(status).not.toContain("Tunnel：healthy");
   });
 
-  it("contains no executable ChatGPT page automation or conversation state", () => {
+  it("keeps Manual Safe Mode production path free of ChatGPT page automation", () => {
+    const skillSafe = read("skill/SKILL.md").split("## Web Research Harness")[0];
     const runtimePolicy = [
-      read("skill/SKILL.md"),
+      skillSafe,
       read("src/cli/index.ts"),
       read("src/config/endpoint.ts"),
       read("src/prompt/generate.ts"),
@@ -88,5 +89,18 @@ describe("secure operational policy", () => {
     expect(runtimePolicy).not.toContain('.command("session")');
     expect(fs.existsSync(path.join(root, "src/session/state.ts"))).toBe(false);
     expect(fs.existsSync(path.join(root, "src/config/ui-prefs.ts"))).toBe(false);
+    const start = read("src/cli/index.ts").split("// ---------------------------------------------------------------- start")[1]
+      .split("// ---------------------------------------------------------------- setup")[0];
+    expect(start).not.toMatch(/web-profile|playwright|openChatSession|ensureWebProfileDir/);
+  });
+
+  it("pins playwright-core and loads it only from the optional Web Harness", () => {
+    const pkg = JSON.parse(read("package.json")) as { dependencies: Record<string, string> };
+    expect(pkg.dependencies["playwright-core"]).toBe("1.55.1");
+    expect(read("src/web/browser.ts")).toContain('await import("playwright-core")');
+    expect(read("src/cli/index.ts")).not.toMatch(/playwright-core/);
+    expect(read("src/mcp/server.ts")).not.toMatch(/playwright|chatgpt\.com/);
+    expect(read("skill/SKILL.md")).toContain("## Web Research Harness");
+    expect(read("skill/SKILL.md")).toContain("c2c web login");
   });
 });

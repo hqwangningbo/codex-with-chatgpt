@@ -13,10 +13,13 @@ manually carries short prompts and replies between them.
 
 ## Non-negotiable rules
 
-1. Never open, control, inspect, or automate the ChatGPT web interface.
+1. Never open, control, inspect, or automate the ChatGPT web interface for
+   Bridge, Connector, planning, or review. The only exception is the explicit
+   Web Research Harness below, and only after the user asked for `c2c web`.
 2. Never create, delete, reconnect, or edit a ChatGPT Connector.
 3. Never type or send a message to ChatGPT and never read a ChatGPT reply
-   except when the user pastes it into this Codex conversation.
+   except when the user pastes it into this Codex conversation, or when the
+   user explicitly started `c2c web` Research.
 4. Never save or restore ChatGPT conversation or Project URLs.
 5. Never paste code, diffs, logs, tokens, pairing codes, or the MCP URL into a
    ChatGPT prompt. ChatGPT reads authorized data through the named Connector.
@@ -253,6 +256,53 @@ complete `read_file`; a truncated read cannot overwrite the file.
 To close access, run:
 
 `c2c write-scope clear -w <workspace>`
+
+## Web Research Harness
+
+Optional. Manual Safe Mode remains the default. Do not start this path for
+ordinary planning, review, Bridge, or Connector work.
+
+Natural-language triggers:
+
+- “用网页版 ChatGPT 研究这个项目”
+- “让 ChatGPT Web 做 Research”
+- “用 Pro 网页额度研究”
+- “让网页版 ChatGPT 研究并沉淀文档”
+
+Behavior:
+
+1. Resolve `<workspace>` the same way as Daily Bridge lifecycle.
+2. If the user did not ask for Web Research, do not run `c2c web`.
+3. Never run `c2c web` as a side effect of `c2c start`.
+4. Run `c2c web status --json`. If `profileExists` is false, tell the user to
+   run `c2c web login` themselves and wait. Do not type their password.
+5. Read-only research may start without Writable Scope.
+6. If the user wants written documents, file changes, or a POC, first run
+   `c2c write-scope status -w <workspace> --json`. If it is inactive, do not
+   grant access. Tell them to set an explicit Workspace-relative root:
+
+   `c2c write-scope set -w <workspace> --root <path> --mode write|poc --yes`
+
+   If they did not name a directory, ask: “允许写哪个 Workspace-relative 目录？”
+   Never default to the whole Workspace, `docs/research`, or a source tree.
+7. If they explicitly want the entire current project, and they named that
+   intent, then and only then guide:
+
+   `c2c write-scope set -w <workspace> --root . --mode poc --allow-workspace-root --yes`
+8. Mutable Web Research also needs a live Bridge. If write-scope status is
+   active but Bridge is down, return `BRIDGE_NOT_RUNNING` and ask the user to
+   start it. Never start, restart, or stop Bridge from this Harness.
+9. Then run:
+
+   `c2c web research -w <workspace> --task "<user task>" --model current`
+
+`c2c web stop` stops only the Harness. It must not stop Bridge, clear Tunnel,
+or delete the browser profile. `c2c web logout --yes` deletes the dedicated
+profile after explicit confirmation.
+
+ChatGPT Web cannot set, widen, or clear Writable Scope. Local dispatcher
+policy, `.env` denial, and POC sandbox still apply even if the model is
+prompt-injected.
 
 ## Repair
 

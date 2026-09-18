@@ -6,9 +6,11 @@ C2C has one automated data plane only:
 ChatGPT → official Connector → OAuth → default-read-only MCP → Workspace
 ```
 
-There is no automated ChatGPT control plane. The user manually copies a short
-planning or review prompt to ChatGPT and manually brings the response back to
-Codex. C2C does not know which Chat, conversation, or Project the user chooses.
+There is no automated ChatGPT control plane in Manual Safe Mode. The user
+manually copies a short planning or review prompt to ChatGPT and manually
+brings the response back to Codex. C2C does not know which Chat, conversation,
+or Project the user chooses. The optional `c2c web` Harness is a separate
+local chatgpt.com path; it is not part of this Connector protocol.
 
 ## Setup
 
@@ -74,9 +76,10 @@ returns the result to Codex.
 
 ## Security invariants
 
-- No ChatGPT page or account automation.
+- No ChatGPT page or account automation in Manual Safe Mode. Optional
+  `c2c web` is a separate, explicit chatgpt.com UI path.
 - No automatic message send, reply read, polling, conversation URL storage, or
-  Connector mutation.
+  Connector mutation on the Connector path.
 - No code, diff, output body, token, pairing code, or MCP URL in generated
   prompts.
 - OAuth grants remain read-only by default. `write_file` and sandboxed

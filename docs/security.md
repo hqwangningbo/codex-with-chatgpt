@@ -8,9 +8,11 @@
 2. **Workspace content is untrusted.** README, comments, diffs may contain
    prompt injection. Every MCP tool description carries an explicit warning and
    tools never grant capabilities based on file content.
-3. **No ChatGPT automation exists.** The user manually configures the
+3. **Manual Safe Mode has no ChatGPT automation.** The user manually configures the
    Connector, enters the one-time pairing code, and carries prompts/replies.
-   Access/refresh tokens travel only through OAuth endpoints.
+   Access/refresh tokens travel only through OAuth endpoints. The optional
+   `c2c web` Harness is a separate local chatgpt.com UI path and is never
+   started by `c2c start`.
 
 ## Threat model → mitigations
 
@@ -32,7 +34,7 @@
 | Admin API abuse | Loopback-only + random admin token (0600 runtime file) + requests with proxy headers (`cf-connecting-ip`, `x-forwarded-for`) rejected; unauthenticated probes get 404 |
 | Log credential leakage | Logger redacts token prefixes, bearer headers, token-like parameters, and pairing-code-shaped strings before writing |
 | Execution output leak | Codex may nominate test/build/lint logs; a local sanitizer redacts tokens, pairing-code-shaped strings and home paths, truncates size, and refuses private-key blocks entirely. Restricted items are listed without a body. ChatGPT still cannot run commands. |
-| Account automation | C2C has no ChatGPT page control, message send/read, polling, Connector mutation, or conversation URL state |
+| Account automation | Manual Safe Mode has no ChatGPT page control, message send/read, polling, Connector mutation, or conversation URL state. Optional `c2c web` uses a dedicated 0700 profile, Temporary Chat, fail-closed UI drift, and a local dispatcher that cannot widen Writable Scope or read `.env`. |
 
 ## Token & scope design
 
@@ -49,8 +51,11 @@ Access tokens: 1 hour. Refresh tokens: 30 days, rotated. All tokens bound to
 State lives under the OS-convention app dir
 (`~/Library/Application Support/codex-with-chatgpt` on macOS), directories 0700,
 files 0600. Named-hostname preference and tunnel metadata live there too
-(`tunnels/<workspaceId>.json`) — never in the project. Only SHA-256 hashes of
-tokens are persisted — a stolen state file does not yield usable bearer tokens.
+(`tunnels/<workspaceId>.json`) — never in the project. The optional Web
+Research profile lives at `<stateDir>/web-profile/` (0700) and task metadata
+at `<stateDir>/web/runtime.json` (no cookies, prompts, or page dumps). Only
+SHA-256 hashes of tokens are persisted — a stolen state file does not yield
+usable bearer tokens.
 
 **V1 limitation**: client registrations and token hashes are file-based rather
 than OS-keychain-based. Raw tokens are never written anywhere. Keychain

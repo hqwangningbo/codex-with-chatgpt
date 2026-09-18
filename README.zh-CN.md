@@ -49,9 +49,9 @@ Workspace。Codex 保留本地编辑、Shell、Git、Foundry 和测试权限。
 - 创建、恢复 Chat 或 Project
 - 保存 ChatGPT conversation URL
 
-Manual Safe Mode 是默认且唯一推荐模式。这样可减少账号自动化、风控以及高价值
-代码环境中的额外攻击面。可选固定 Tunnel 的 Cloudflare 账号授权仍是独立、
-明确的人工操作。
+以上约束适用于默认的 Manual Safe Mode / Connector 路径。可选的 `c2c web`
+Research Harness 会在用户显式命令后操作可见的 chatgpt.com 页面；`c2c start`
+绝不会启动它。可选固定 Tunnel 的 Cloudflare 账号授权仍是独立、明确的人工操作。
 
 ## MCP 工具
 
@@ -83,6 +83,23 @@ c2c write-scope clear -w <workspace>
 
 源码目录还需要 `--yes`；根目录 `.` 还需要 `--allow-workspace-root`。
 `c2c stop` 会清除当前 Writable Scope。
+
+## 可选 Web Research Harness
+
+`c2c web` 是显式可选路径。ChatGPT 网页版（用户自己的 chatgpt.com 会话）负责
+推理，C2C 只做本地 capability 边界。它不使用 Codex 模型、OpenAI API、
+ChatGPT API Key，也不走 ChatGPT 私有接口。
+
+```bash
+c2c web login
+c2c web research -w /path/to/project --task "..." --model current
+c2c web status
+c2c web stop
+c2c web logout --yes
+```
+
+登录使用 C2C 状态目录下独立的 0700 浏览器 Profile。Writable Scope 与 `.env`
+规则仍然生效。Harness 不写 Git，也不启动或停止 Bridge / Tunnel。
 
 ## 安全安装
 
