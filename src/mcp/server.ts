@@ -91,6 +91,7 @@ const listDirectoryOutputSchema = {
 const readFileOutputSchema = {
   path: z.string(),
   sha256: z.string(),
+  writable_sha256: z.string().nullable(),
   sizeBytes: z.number().int().nonnegative(),
   totalLines: z.number().int().nonnegative(),
   startLine: z.number().int().positive(),
@@ -527,11 +528,11 @@ export function createMcpServer(ctx: McpContext): McpServer {
       title: "Write file inside Writable Root",
       description:
         `Atomically create or update one text file inside the locally authorized Writable Root. ` +
-        `Existing files require the sha256 returned by read_file. Sensitive files are always denied. ${UNTRUSTED_NOTE}`,
+        `Existing files require writable_sha256 from a complete read_file. Partial reads cannot overwrite. Sensitive files are always denied. ${UNTRUSTED_NOTE}`,
       inputSchema: {
         path: z.string().min(1).describe("Workspace-relative target path"),
         content: z.string().max(1024 * 1024),
-        expected_sha256: z.string().regex(/^[0-9a-f]{64}$/i).optional(),
+        expected_writable_sha256: z.string().regex(/^[0-9a-f]{64}$/i).optional(),
       },
       outputSchema: writeFileOutputSchema,
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
@@ -546,7 +547,7 @@ export function createMcpServer(ctx: McpContext): McpServer {
             scope: activeWriteScope(workspace.id, bridgeStartedAt),
             path: args.path,
             content: args.content,
-            expectedSha256: args.expected_sha256,
+            expectedWritableSha256: args.expected_writable_sha256,
           })
         );
       } catch (error) {

@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll, afterEach } from "vitest";
+import fs from "node:fs";
+import path from "node:path";
 import { Workspace } from "../src/workspace/manager.js";
 import { searchWorkspace, resetRipgrepCache, findRipgrep } from "../src/workspace/search.js";
 import { makeTmpDir, cleanup, write } from "./helpers.js";
@@ -101,5 +103,36 @@ describe.each(engines())("search engine: %s", (engine) => {
     await expect(searchWorkspace(ws, { query: "BEGIN OPENSSH" })).rejects.toMatchObject({
       code: "ACCESS_DENIED_SENSITIVE_FILE",
     });
+  });
+});
+
+describe("search hardlink aliases", () => {
+  it("does not leak .env contents through an ordinary-named hardlink", async () => {
+    const aliasRoot = makeTmpDir("search-hardlink");
+    write(aliasRoot, "src/app.ts", "export const ok = 1;\n");
+    write(aliasRoot, ".env", "PASSWORD=plain-value\nDATABASE_URL=plain-value\n");
+    try {
+      fs.linkSync(path.join(aliasRoot, ".env"), path.join(aliasRoot, "notes-plain.txt"));
+    } catch {
+      cleanup(aliasRoot);
+      return;
+    }
+    const aliasWs = new Workspace(aliasRoot);
+    try {
+      for (const engine of engines()) {
+        if (engine === "node") process.env.C2C_DISABLE_RG = "1";
+        else delete process.env.C2C_DISABLE_RG;
+        resetRipgrepCache();
+        const result = await searchWorkspace(aliasWs, { query: "plain-value" });
+        expect(result.engine).toBe(engine);
+        expect(result.matches.map((match) => match.path)).not.toContain("notes-plain.txt");
+        expect(JSON.stringify(result.matches)).not.toContain("PASSWORD=plain-value");
+        expect(JSON.stringify(result.matches)).not.toContain("DATABASE_URL=plain-value");
+      }
+    } finally {
+      delete process.env.C2C_DISABLE_RG;
+      resetRipgrepCache();
+      cleanup(aliasRoot);
+    }
   });
 });

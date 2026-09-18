@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import readline from "node:readline";
 import { IgnoreRules } from "./ignore.js";
 import { sanitizeWorkspaceText } from "./sanitize.js";
@@ -32,6 +32,7 @@ const normCase = (p: string): string => (CASE_INSENSITIVE ? p.toLowerCase() : p)
 export interface ReadFileResult {
   path: string;
   sha256: string;
+  writable_sha256: string | null;
   sizeBytes: number;
   totalLines: number;
   startLine: number;
@@ -87,6 +88,7 @@ export class Workspace {
   readonly name: string;
   readonly ignoreRules: IgnoreRules;
   readonly projectConfig: ProjectConfig;
+  private readonly writeTokenKey: Buffer;
 
   constructor(rootInput: string) {
     const resolved = path.resolve(rootInput);
@@ -104,6 +106,17 @@ export class Workspace {
     this.ignoreRules = new IgnoreRules(real);
     this.projectConfig = parseProjectConfig(readJsonIfExists<unknown>(path.join(real, ".c2c.json")));
     this.name = this.projectConfig.name ?? path.basename(real);
+    this.writeTokenKey = randomBytes(32);
+  }
+
+  issueWritableSha256(fileSha256: string): string {
+    return createHmac("sha256", this.writeTokenKey).update(`writable:${fileSha256}`).digest("hex");
+  }
+
+  verifyWritableSha256(fileSha256: string, token: string): boolean {
+    const expected = Buffer.from(this.issueWritableSha256(fileSha256), "hex");
+    const provided = Buffer.from(token.toLowerCase(), "hex");
+    return expected.length === provided.length && timingSafeEqual(expected, provided);
   }
 
   private contains(candidate: string): boolean {
@@ -251,16 +264,20 @@ export class Workspace {
       );
     }
     const remaining = Math.max(0, totalLines - actualEnd);
+    const truncated = remaining > 0 || byteTruncated;
+    const sha256 = await this.sha256File(abs);
+    const complete = startLine <= 1 && !truncated;
     return {
       path: rel,
-      sha256: await this.sha256File(abs),
+      sha256,
+      writable_sha256: complete ? this.issueWritableSha256(sha256) : null,
       sizeBytes: stat.size,
       totalLines,
       startLine: Math.min(startLine, Math.max(totalLines, 1)),
       endLine: actualEnd,
-      truncated: remaining > 0,
+      truncated,
       remainingLines: remaining,
-      nextStartLine: remaining > 0 ? actualEnd + 1 : null,
+      nextStartLine: truncated ? actualEnd + 1 : null,
       content: sanitized.text,
     };
   }

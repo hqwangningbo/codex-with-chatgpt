@@ -86,7 +86,7 @@ describe("writeFileWithinScope", () => {
     }
   });
 
-  it("requires expected_sha256 for existing files", async () => {
+  it("requires expected_writable_sha256 from a complete read", async () => {
     const { root, workspace, state } = fixture();
     write(root, "docs/research/a.md", "old\n");
     await expect(
@@ -98,19 +98,40 @@ describe("writeFileWithinScope", () => {
         scope: state,
         path: "docs/research/a.md",
         content: "new\n",
-        expectedSha256: "0".repeat(64),
+        expectedWritableSha256: sha256Bytes("old\n"),
       })
     ).rejects.toMatchObject({ code: "WRITE_PRECONDITION_FAILED" });
-    const expectedSha256 = sha256Bytes("old\n");
+    const complete = await workspace.readFile("docs/research/a.md");
+    expect(complete.truncated).toBe(false);
+    expect(complete.writable_sha256).toEqual(expect.stringMatching(/^[0-9a-f]{64}$/));
+    expect(complete.writable_sha256).not.toBe(complete.sha256);
     await expect(
       writeFileWithinScope({
         workspace,
         scope: state,
         path: "docs/research/a.md",
         content: "new\n",
-        expectedSha256,
+        expectedWritableSha256: complete.writable_sha256 ?? undefined,
       })
     ).resolves.toMatchObject({ sha256: sha256Bytes("new\n"), created: false });
+  });
+
+  it("refuses overwrite credentials from a truncated read", async () => {
+    const { root, workspace, state } = fixture();
+    write(root, "docs/research/big.md", `${Array.from({ length: 500 }, (_, i) => `line ${i + 1}`).join("\n")}\n`);
+    const partial = await workspace.readFile("docs/research/big.md");
+    expect(partial.truncated).toBe(true);
+    expect(partial.writable_sha256).toBeNull();
+    await expect(
+      writeFileWithinScope({
+        workspace,
+        scope: state,
+        path: "docs/research/big.md",
+        content: "replaced\n",
+        expectedWritableSha256: partial.sha256,
+      })
+    ).rejects.toMatchObject({ code: "WRITE_PRECONDITION_FAILED" });
+    expect(fs.readFileSync(path.join(root, "docs/research/big.md"), "utf8")).toContain("line 1");
   });
 
   it("rejects every env variant even when Writable Root is the workspace", async () => {
@@ -160,5 +181,35 @@ describe("writeFileWithinScope", () => {
         ).rejects.toMatchObject({ code: "WRITE_SCOPE_VIOLATION" });
       }
     }
+  });
+
+  it("rejects hardlink aliases of env files even inside Writable Root", async () => {
+    const { root, workspace, state } = fixture();
+    if (process.platform === "win32") {
+      try {
+        fs.linkSync(path.join(root, ".env"), path.join(root, "docs/research/notes.txt"));
+      } catch {
+        return;
+      }
+    } else {
+      fs.linkSync(path.join(root, ".env"), path.join(root, "docs/research/notes.txt"));
+    }
+    await expect(
+      writeFileWithinScope({
+        workspace,
+        scope: state,
+        path: "docs/research/notes.txt",
+        content: "x\n",
+      })
+    ).rejects.toMatchObject({ code: "WRITE_DENIED_SENSITIVE_FILE" });
+    fs.linkSync(path.join(root, ".env.example"), path.join(root, "docs/research/example-notes.txt"));
+    await expect(
+      writeFileWithinScope({
+        workspace,
+        scope: state,
+        path: "docs/research/example-notes.txt",
+        content: "x\n",
+      })
+    ).rejects.toMatchObject({ code: "WRITE_DENIED_SENSITIVE_FILE" });
   });
 });

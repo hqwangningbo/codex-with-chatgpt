@@ -3,6 +3,7 @@ import path from "node:path";
 import { createHash, randomBytes } from "node:crypto";
 import { Workspace, WorkspaceError } from "../workspace/manager.js";
 import { sanitizeWorkspaceText } from "../workspace/sanitize.js";
+import { collectMatchingInodes, fileInodeKey } from "../workspace/ignore.js";
 import { isWriteDenied } from "./policy.js";
 import type { WriteScopeState } from "./state.js";
 
@@ -86,13 +87,28 @@ function assertAllowedPath(workspace: Workspace, scope: WriteScopeState, request
       `Target is outside the active Writable Root '${scope.root}'`
     );
   }
-  if (isWriteDenied(resolved.rel) || workspace.ignoreRules.isSensitive(resolved.rel)) {
+  if (
+    isWriteDenied(resolved.rel) ||
+    workspace.ignoreRules.isSensitive(resolved.rel) ||
+    isDeniedByInode(workspace.root, resolved.abs, isWriteDenied)
+  ) {
     throw new WriteScopeError(
       "WRITE_DENIED_SENSITIVE_FILE",
       `Writing '${resolved.rel}' is permanently denied`
     );
   }
   return resolved;
+}
+
+function isDeniedByInode(root: string, absPath: string, match: (rel: string) => boolean): boolean {
+  const key = fileInodeKey(absPath);
+  if (!key) return false;
+  try {
+    if (fs.lstatSync(absPath).nlink <= 1) return false;
+  } catch {
+    return false;
+  }
+  return collectMatchingInodes(root, match).has(key);
 }
 
 function ensureSafeParents(workspace: Workspace, scope: WriteScopeState, targetAbs: string): void {
@@ -128,7 +144,7 @@ export async function writeFileWithinScope(input: {
   scope: WriteScopeState | null;
   path: string;
   content: string;
-  expectedSha256?: string;
+  expectedWritableSha256?: string;
 }): Promise<WriteFileResult> {
   const { workspace, scope } = input;
   if (!scope) throw new WriteScopeError("WRITE_SCOPE_NOT_ACTIVE", "Writable Scope is not active");
@@ -168,13 +184,13 @@ export async function writeFileWithinScope(input: {
     if (!existingGate.allowed || existingGate.text !== raw) {
       throw new WriteScopeError("WRITE_CONTENT_REJECTED", "Existing file matches the secret policy");
     }
-    if (!input.expectedSha256) {
-      throw new WriteScopeError("PRECONDITION_REQUIRED", "expected_sha256 is required for existing files");
+    if (!input.expectedWritableSha256) {
+      throw new WriteScopeError("PRECONDITION_REQUIRED", "expected_writable_sha256 is required for existing files");
     }
-    if (sha256Bytes(existing) !== input.expectedSha256.toLowerCase()) {
+    if (!workspace.verifyWritableSha256(sha256Bytes(existing), input.expectedWritableSha256)) {
       throw new WriteScopeError("WRITE_PRECONDITION_FAILED", "The file changed since it was read");
     }
-  } else if (input.expectedSha256) {
+  } else if (input.expectedWritableSha256) {
     throw new WriteScopeError("WRITE_PRECONDITION_FAILED", "The target file does not exist");
   }
 
@@ -195,7 +211,7 @@ export async function writeFileWithinScope(input: {
     }
     if (existing) {
       const current = await fs.promises.readFile(target.abs);
-      if (sha256Bytes(current) !== input.expectedSha256?.toLowerCase()) {
+      if (!workspace.verifyWritableSha256(sha256Bytes(current), input.expectedWritableSha256 ?? "")) {
         throw new WriteScopeError("WRITE_PRECONDITION_FAILED", "The file changed during the write");
       }
     }

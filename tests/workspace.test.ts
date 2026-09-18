@@ -118,6 +118,26 @@ describe("sensitive files", () => {
     expectDenied(".env.production");
   });
 
+  it("denies a hardlink alias of .env with an ordinary name", async () => {
+    const alias = path.join(root, "notes-plain.txt");
+    try {
+      fs.linkSync(path.join(root, ".env"), alias);
+    } catch {
+      return;
+    }
+    write(root, ".env", "PASSWORD=plain-value\nDATABASE_URL=plain-value\n");
+    const fresh = new Workspace(root);
+    try {
+      fresh.resolve("notes-plain.txt");
+      expect.unreachable("hardlink alias should be denied");
+    } catch (error) {
+      expect((error as WorkspaceError).code).toBe("ACCESS_DENIED_SENSITIVE_FILE");
+    }
+    await expect(fresh.readFile("notes-plain.txt")).rejects.toMatchObject({
+      code: "ACCESS_DENIED_SENSITIVE_FILE",
+    });
+  });
+
   it("allows .env.example", () => {
     expect(ws.resolve(".env.example").rel).toBe(".env.example");
   });
@@ -171,6 +191,14 @@ describe("read_file pagination", () => {
     expect(result.truncated).toBe(true);
     expect(result.remainingLines).toBe(600);
     expect(result.nextStartLine).toBe(401);
+    expect(result.writable_sha256).toBeNull();
+  });
+
+  it("issues writable_sha256 only for a complete read", async () => {
+    const complete = await ws.readFile("hello.txt");
+    expect(complete.truncated).toBe(false);
+    expect(complete.writable_sha256).toEqual(expect.stringMatching(/^[0-9a-f]{64}$/));
+    expect(complete.writable_sha256).not.toBe(complete.sha256);
   });
 
   it("returns an explicit range", async () => {

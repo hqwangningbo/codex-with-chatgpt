@@ -23,9 +23,9 @@
 | Token theft | Opaque high-entropy tokens; stored only as SHA-256 hashes; access tokens live 1 h; refresh tokens rotate on every use (replay of the old one fails); revocation endpoint + `c2c unpair` |
 | Workspace traversal | `realpath` canonicalization of the deepest existing ancestor; containment check against the canonical root; case-insensitive comparison on macOS/Windows; rejects `..`, absolute escapes, backslash tricks, null bytes |
 | Symlink escape | Canonicalization resolves symlinks before the containment check (file and directory symlinks both covered by tests) |
-| Sensitive files | Deny-by-default patterns (.env*, keys, SSH, cloud creds, Web3 wallets/keystores/seed material…) enforced at resolve time; `.c2cignore` extends them; `.env.example` allowed |
-| Limited writes | Disabled by default; requires an explicitly requested OAuth scope and a machine-local Writable Root bound to the current Bridge session. Existing files use SHA-256 compare-and-swap and atomic rename. |
-| POC execution | `poc` mode only; fixed program/argument policy, no shell, stripped environment, bounded output/time, and macOS Seatbelt default-deny filesystem/network profile. |
+| Sensitive files | Deny-by-default patterns (.env*, keys, SSH, cloud creds, Web3 wallets/keystores/seed material…) enforced at resolve time, including hardlink aliases of those files; `.c2cignore` extends them; `.env.example` allowed to read |
+| Limited writes | Disabled by default; requires an explicitly requested OAuth scope and a machine-local Writable Root bound to the current Bridge session. Existing files require `writable_sha256` from a complete `read_file`; truncated reads cannot overwrite. |
+| POC execution | `poc` mode only; fixed program/argument policy, no shell, stripped environment, bounded output/time, and macOS Seatbelt default-deny. Reads are Workspace + minimal runtime paths; writes are `<writeRoot>/**` only. Never a filesystem-wide read root. |
 | Secret in a normally named file | `read_file`, search results, and `git_diff` reject private-key blocks and redact obvious API tokens, secret assignments, and context-qualified 32-byte Web3 keys |
 | Oversized file / diff DoS | read_file caps lines and bytes per response; git_diff paginates by byte offset with hard caps; search caps matches and file sizes |
 | Tunnel exposure | Bridge binds 127.0.0.1 only (refuses 0.0.0.0); the only public surface is HTTPS via the tunnel, protected by OAuth; `/health` reveals only a salted workspace hash |
@@ -60,6 +60,8 @@ integration is a V2 item.
 
 ChatGPT cannot set or widen Writable Scope, delete/rename files, run arbitrary
 shell, commit, or install packages. `.env` and every `.env.*` are never
-readable; `.env.example` is read-only. No Writable Root, including `.`, can
-override these rules. A POC runs only when the macOS filesystem sandbox is
-available and prevents sensitive-file access.
+readable or writable, including hardlink aliases with ordinary names;
+`.env.example` is read-only. No Writable Root, including `.`, can override
+these rules. A POC reads Workspace non-sensitive files and may write only
+inside `<writeRoot>/**`. It runs only when the macOS filesystem sandbox is
+available and does not grant filesystem-wide reads.

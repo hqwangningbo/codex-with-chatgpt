@@ -324,4 +324,21 @@ describe("gitDiff pagination", () => {
 
     git(repo, "reset", "--hard", "HEAD");
   });
+
+  it("does not leak .env contents through an ordinary-named hardlink", () => {
+    write(repo, ".env", "PASSWORD=plain-value\nDATABASE_URL=plain-value\n");
+    try {
+      fs.linkSync(path.join(repo, ".env"), path.join(repo, "notes-plain.txt"));
+    } catch {
+      return;
+    }
+    git(repo, "add", "-f", "notes-plain.txt");
+    const diff = gitDiff(repo, { mode: "staged" });
+    expect(diff.diff).not.toContain("PASSWORD=plain-value");
+    expect(diff.diff).not.toContain("DATABASE_URL=plain-value");
+    expect(diff.diff).not.toContain("notes-plain.txt");
+    git(repo, "rm", "-f", "--cached", "notes-plain.txt");
+    fs.rmSync(path.join(repo, "notes-plain.txt"), { force: true });
+    fs.rmSync(path.join(repo, ".env"), { force: true });
+  });
 });

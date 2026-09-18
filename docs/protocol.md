@@ -82,6 +82,7 @@ returns the result to Codex.
 - OAuth grants remain read-only by default. `write_file` and sandboxed
   `run_poc` require explicitly requested OAuth scopes plus a local,
   session-bound Writable Root. ChatGPT cannot set or widen that root.
-- `.env`, every `.env.*`, and `.env.example` writes are permanently denied;
-  POC subprocesses cannot read or write them.
+- `.env`, every `.env.*`, and `.env.example` writes are permanently denied,
+  including hardlink aliases; POC subprocesses cannot read or write them.
+  `write_file` overwrites require `writable_sha256` from a complete `read_file`.
 - Only Codex can perform arbitrary shell, package, delete/rename, or Git writes.

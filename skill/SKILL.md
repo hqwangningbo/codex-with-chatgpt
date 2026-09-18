@@ -244,9 +244,11 @@ ChatGPT cannot set, widen, or clear its own scope. A scope ends on `c2c stop`
 or Bridge restart and must be explicitly granted again.
 
 Permanent rule: `.env`, every `.env.*` in every directory, and `.env.example`
-are never writable. Real env files are never readable. `run_poc` must not read
-or write them, even when Writable Root is `.`. Never weaken this rule or run a
-POC without the macOS filesystem sandbox.
+are never writable. Real env files are never readable, including hardlink
+aliases with ordinary names. `run_poc` must not read or write them, even when
+Writable Root is `.`. Never weaken this rule or run a POC without the macOS
+filesystem sandbox. `write_file` overwrites require `writable_sha256` from a
+complete `read_file`; a truncated read cannot overwrite the file.
 
 To close access, run:
 

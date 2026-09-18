@@ -113,7 +113,7 @@ describe("MCP tools over Streamable HTTP", () => {
 
     expectToolOutputSchema(tools, "workspace_info", ["workspaceId", "workspaceName", "projectType", "git"]);
     expectToolOutputSchema(tools, "list_directory", ["path", "entries", "total", "hasMore"]);
-    expectToolOutputSchema(tools, "read_file", ["path", "sha256", "content", "startLine", "endLine", "nextStartLine"]);
+    expectToolOutputSchema(tools, "read_file", ["path", "sha256", "writable_sha256", "content", "startLine", "endLine", "nextStartLine"]);
     expectToolOutputSchema(tools, "search_workspace", ["matches", "matchCount", "truncated", "engine"]);
     expectToolOutputSchema(tools, "git_status", ["isRepo", "branch", "staged", "unstaged", "untracked", "hidden"]);
     expectToolOutputSchema(tools, "git_diff", ["isRepo", "mode", "diff", "hasMore", "nextOffset"]);
@@ -209,13 +209,15 @@ describe("MCP tools over Streamable HTTP", () => {
         name: "read_file",
         arguments: { path: "docs/research/a.md" },
       });
-      const file = structuredJsonOf<{ sha256: string }>(read);
+      const file = structuredJsonOf<{ sha256: string; writable_sha256: string | null; truncated: boolean }>(read);
+      expect(file.truncated).toBe(false);
+      expect(file.writable_sha256).toEqual(expect.stringMatching(/^[0-9a-f]{64}$/));
       const updated = await writeClient.callTool({
         name: "write_file",
         arguments: {
           path: "docs/research/a.md",
           content: "second\n",
-          expected_sha256: file.sha256,
+          expected_writable_sha256: file.writable_sha256,
         },
       });
       expect(updated.isError).not.toBe(true);
@@ -266,6 +268,38 @@ describe("MCP tools over Streamable HTTP", () => {
     const nested = await client.callTool({ name: "read_file", arguments: { path: "foo/.env.local" } });
     expect(nested.isError).toBe(true);
     expect(textOf(nested)).not.toContain("never-return-this");
+  });
+
+  it("denies .env hardlink aliases through read, search, and git_diff", async () => {
+    write(root, ".env", "API_KEY=supersecret\nPASSWORD=plain-value\nDATABASE_URL=plain-value\n");
+    const alias = path.join(root, "notes-plain.txt");
+    try {
+      fs.linkSync(path.join(root, ".env"), alias);
+    } catch {
+      return;
+    }
+    const read = await client.callTool({ name: "read_file", arguments: { path: "notes-plain.txt" } });
+    expect(read.isError).toBe(true);
+    expect(textOf(read)).toContain("ACCESS_DENIED_SENSITIVE_FILE");
+    expect(textOf(read)).not.toContain("PASSWORD=plain-value");
+    expect(textOf(read)).not.toContain("DATABASE_URL=plain-value");
+
+    const search = await client.callTool({
+      name: "search_workspace",
+      arguments: { query: "plain-value" },
+    });
+    expect(textOf(search)).not.toContain("PASSWORD=plain-value");
+    expect(textOf(search)).not.toContain("DATABASE_URL=plain-value");
+    expect(textOf(search)).not.toContain("notes-plain.txt");
+
+    git(root, "add", "-f", "notes-plain.txt");
+    const diff = await client.callTool({
+      name: "git_diff",
+      arguments: { mode: "staged" },
+    });
+    expect(textOf(diff)).not.toContain("PASSWORD=plain-value");
+    expect(textOf(diff)).not.toContain("DATABASE_URL=plain-value");
+    git(root, "rm", "-f", "--cached", "notes-plain.txt");
   });
 
   it("read_file denies paths outside the workspace", async () => {

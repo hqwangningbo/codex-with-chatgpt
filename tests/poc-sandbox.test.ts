@@ -3,17 +3,20 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { Workspace } from "../src/workspace/manager.js";
 import { runPoc } from "../src/poc/run.js";
+import { createPocSandbox, isUnsafeSandboxReadRoot, runtimeReadRoots } from "../src/poc/sandbox.js";
 import type { WriteScopeState } from "../src/write-scope/state.js";
 import { cleanup, makeTmpDir, write } from "./helpers.js";
 
+const ENV_PLAIN = "PASSWORD=plain-value\nDATABASE_URL=plain-value\n";
 const roots: string[] = [];
 
 function fixture(mode: "write" | "poc" = "poc") {
   const root = makeTmpDir("poc-sandbox");
   roots.push(root);
   fs.mkdirSync(path.join(root, "test/poc"), { recursive: true });
-  write(root, ".env", "PRIVATE_KEY=never-expose\n");
-  write(root, ".env.local", "MNEMONIC=never-expose\n");
+  write(root, ".env", ENV_PLAIN);
+  write(root, ".env.local", ENV_PLAIN);
+  write(root, "visible.txt", "WORKSPACE_MARKER\n");
   const workspace = new Workspace(root);
   const scope: WriteScopeState = {
     workspaceId: workspace.id,
@@ -32,6 +35,31 @@ afterEach(() => {
 
 const macIt = process.platform === "darwin" ? it : it.skip;
 
+const probeScript = `import fs from "node:fs";
+const target = process.argv[2];
+const mode = process.argv[3];
+try {
+  if (mode === "read") process.stdout.write(fs.readFileSync(target, "utf8"));
+  else {
+    fs.writeFileSync(target, "pwned\\n");
+    process.stdout.write("WRITE_ALLOWED");
+  }
+} catch (e) {
+  process.stdout.write("DENIED:" + (e.code || "ERR"));
+}
+`;
+
+describe("POC sandbox read roots", () => {
+  it("never derives a filesystem-wide read root from /bin/echo", () => {
+    const executables = [process.execPath];
+    if (fs.existsSync("/bin/echo")) executables.push("/bin/echo");
+    const rootsFound = runtimeReadRoots(executables);
+    expect(rootsFound.some((root) => isUnsafeSandboxReadRoot(root))).toBe(false);
+    expect(rootsFound).not.toContain("/");
+    expect(rootsFound).not.toContain("/private");
+  });
+});
+
 describe("runPoc policy", () => {
   it("rejects inactive/write-only scopes and shell programs", async () => {
     const { root, workspace, scope } = fixture("write");
@@ -43,7 +71,12 @@ describe("runPoc policy", () => {
       runPoc({ workspace, scope, program: "node", args: [] })
     ).rejects.toMatchObject({ code: "POC_NOT_ALLOWED" });
     await expect(
-      runPoc({ workspace, scope: { ...scope, mode: "poc" }, program: "bash", args: [] })
+      runPoc({
+        workspace,
+        scope: { ...scope, mode: "poc" },
+        program: "bash",
+        args: [],
+      })
     ).rejects.toMatchObject({ code: "POC_PROGRAM_NOT_ALLOWED" });
     await expect(
       runPoc({
@@ -70,6 +103,24 @@ describe("runPoc policy", () => {
     await expect(
       runPoc({ workspace, scope, program: "forge", args: ["test"] })
     ).rejects.toMatchObject({ code: "POC_ARGUMENTS_NOT_ALLOWED" });
+  });
+
+  macIt("does not emit a filesystem-wide Seatbelt read allow", () => {
+    const { workspace, scope } = fixture();
+    const sandbox = createPocSandbox({
+      workspace,
+      scope,
+      executable: process.execPath,
+      extraExecutables: ["/bin/echo"],
+    });
+    try {
+      const profile = fs.readFileSync(sandbox.profileFile, "utf8");
+      expect(profile).not.toMatch(/\(subpath\s+"\/"\)/);
+      expect(profile).not.toMatch(/\(subpath\s+"\/private"\)/);
+      expect(profile).toContain(`(subpath ${JSON.stringify(path.join(workspace.root, "test/poc"))}`);
+    } finally {
+      sandbox.cleanup();
+    }
   });
 
   macIt("runs allowlisted Node argv without shell expansion and strips secret env", async () => {
@@ -112,6 +163,61 @@ describe("runPoc policy", () => {
     }
   });
 
+  macIt("confines reads and writes to Workspace / Writable Root", async () => {
+    const { root, workspace, scope } = fixture();
+    const outsideDir = makeTmpDir("poc-outside");
+    roots.push(outsideDir);
+    const outside = write(outsideDir, "secret.txt", "OUTSIDE_MARKER\n");
+    write(root, "test/poc/probe.mjs", probeScript);
+    try {
+      const outsideRead = await runPoc({
+        workspace,
+        scope,
+        program: "node",
+        args: ["test/poc/probe.mjs", outside, "read"],
+      });
+      expect(outsideRead.stdout).toMatch(/^DENIED:/);
+      expect(outsideRead.stdout).not.toContain("OUTSIDE_MARKER");
+
+      const outsideWrite = await runPoc({
+        workspace,
+        scope,
+        program: "node",
+        args: ["test/poc/probe.mjs", outside, "write"],
+      });
+      expect(outsideWrite.stdout).toMatch(/^DENIED:/);
+      expect(fs.readFileSync(outside, "utf8")).toBe("OUTSIDE_MARKER\n");
+
+      const insideWrite = await runPoc({
+        workspace,
+        scope,
+        program: "node",
+        args: ["test/poc/probe.mjs", path.join(root, "test/poc/artifact.txt"), "write"],
+      });
+      expect(insideWrite.stdout).toBe("WRITE_ALLOWED");
+      expect(fs.readFileSync(path.join(root, "test/poc/artifact.txt"), "utf8")).toBe("pwned\n");
+
+      const workspaceRead = await runPoc({
+        workspace,
+        scope,
+        program: "node",
+        args: ["test/poc/probe.mjs", path.join(root, "visible.txt"), "read"],
+      });
+      expect(workspaceRead.stdout).toContain("WORKSPACE_MARKER");
+
+      const workspaceWrite = await runPoc({
+        workspace,
+        scope,
+        program: "node",
+        args: ["test/poc/probe.mjs", path.join(root, "visible.txt"), "write"],
+      });
+      expect(workspaceWrite.stdout).toMatch(/^DENIED:/);
+      expect(fs.readFileSync(path.join(root, "visible.txt"), "utf8")).toBe("WORKSPACE_MARKER\n");
+    } finally {
+      fs.rmSync(outside, { force: true });
+    }
+  });
+
   macIt("blocks Node read, write, symlink, and hardlink access to .env", async () => {
     const { root, workspace, scope } = fixture();
     const alias = path.join(root, "test/poc/env-alias");
@@ -120,7 +226,7 @@ describe("runPoc policy", () => {
     write(
       root,
       "test/poc/env.mjs",
-      `import fs from "node:fs";\nimport path from "node:path";\nimport { fileURLToPath } from "node:url";\nconst here=path.dirname(fileURLToPath(import.meta.url));\nconst env=path.resolve(here,"../../.env");\nconst checks=[];\nfor (const [name,fn] of [\n [\"read\",()=>fs.readFileSync(env,\"utf8\")],\n [\"write\",()=>fs.writeFileSync(env,\"changed\")],\n [\"symlink\",()=>fs.readFileSync(path.join(here,\"env-link\"),\"utf8\")],\n [\"alias\",()=>fs.readFileSync(path.join(here,\"env-alias\"),\"utf8\")],\n [\"newlink\",()=>{fs.linkSync(env,path.join(here,\"new-alias\")); return fs.readFileSync(path.join(here,\"new-alias\"),\"utf8\")}],\n]) { try { fn(); checks.push(name+\":ALLOWED\") } catch(e) { checks.push(name+\":\"+e.code) } }\nconsole.log(checks.join(\"\\n\"));\n`
+      `import fs from "node:fs";\nimport path from "node:path";\nimport { fileURLToPath } from "node:url";\nconst here=path.dirname(fileURLToPath(import.meta.url));\nconst env=path.resolve(here,"../../.env");\nconst alias=path.join(here,"env-alias");\nconst checks=[];\nfor (const [name,fn] of [\n ["read",()=>fs.readFileSync(env,"utf8")],\n ["write",()=>fs.writeFileSync(env,"changed")],\n ["symlink",()=>fs.readFileSync(path.join(here,"env-link"),"utf8")],\n ["alias",()=>fs.readFileSync(alias,"utf8")],\n ["aliasWrite",()=>fs.writeFileSync(alias,"changed")],\n ["newlink",()=>{fs.linkSync(env,path.join(here,"new-alias")); return fs.readFileSync(path.join(here,"new-alias"),"utf8")}],\n]) { try { fn(); checks.push(name+":ALLOWED") } catch(e) { checks.push(name+":"+e.code) } }\nconsole.log(checks.join("\\n"));\n`
     );
     const result = await runPoc({
       workspace,
@@ -130,8 +236,10 @@ describe("runPoc policy", () => {
     });
     expect(result.exitCode).toBe(0);
     expect(result.stdout).not.toContain("ALLOWED");
-    expect(result.stdout).not.toContain("never-expose");
-    expect(fs.readFileSync(path.join(root, ".env"), "utf8")).toContain("never-expose");
+    expect(result.stdout).not.toContain("PASSWORD=plain-value");
+    expect(result.stdout).not.toContain("DATABASE_URL=plain-value");
+    expect(fs.readFileSync(path.join(root, ".env"), "utf8")).toBe(ENV_PLAIN);
+    expect(fs.readFileSync(alias, "utf8")).toBe(ENV_PLAIN);
   });
 
   macIt("blocks Python read and write of .env", async () => {
@@ -148,8 +256,8 @@ describe("runPoc policy", () => {
       args: ["test/poc/env.py"],
     });
     expect(result.stdout).not.toContain("ALLOWED");
-    expect(result.stdout).not.toContain("never-expose");
-    expect(fs.readFileSync(path.join(root, ".env.local"), "utf8")).toContain("never-expose");
+    expect(result.stdout).not.toContain("PASSWORD=plain-value");
+    expect(fs.readFileSync(path.join(root, ".env.local"), "utf8")).toBe(ENV_PLAIN);
   });
 
   macIt("denies network, enforces timeout, and caps output", async () => {

@@ -20,6 +20,99 @@ function sbplString(value: string): string {
   return JSON.stringify(value);
 }
 
+const BROAD_READ_ROOTS = new Set(["/", "/private", "/usr", "/System", "/Library", "/opt", "/Users", "/home", "/Volumes"]);
+
+export function isUnsafeSandboxReadRoot(root: string): boolean {
+  let normalized: string;
+  try {
+    normalized = fs.realpathSync.native(root);
+  } catch {
+    normalized = path.resolve(root);
+  }
+  if (BROAD_READ_ROOTS.has(normalized)) return true;
+  const home = os.homedir();
+  return normalized === home || normalized === path.dirname(home);
+}
+
+function parentDirectories(abs: string): string[] {
+  const parents: string[] = [];
+  let current = path.resolve(abs);
+  for (;;) {
+    const parent = path.dirname(current);
+    if (parent === current) {
+      parents.push(current);
+      break;
+    }
+    parents.push(parent);
+    current = parent;
+  }
+  return parents;
+}
+
+function metadataAllowRoots(paths: string[]): string[] {
+  return [
+    ...new Set(
+      paths.flatMap((item) => {
+        try {
+          return parentDirectories(fs.realpathSync.native(item));
+        } catch {
+          return parentDirectories(path.resolve(item));
+        }
+      })
+    ),
+  ];
+}
+function addExistingRoot(roots: Set<string>, candidate: string): void {
+  try {
+    const real = fs.realpathSync.native(candidate);
+    if (!fs.statSync(real).isDirectory()) return;
+    if (isUnsafeSandboxReadRoot(real)) return;
+    roots.add(real);
+  } catch {
+    // Missing or unreadable runtime paths are simply not granted.
+  }
+}
+
+/**
+ * Directories a allowlisted interpreter/compiler may read. Never `/` or other
+ * filesystem-wide roots, even when an extra executable lives in `/bin`.
+ */
+export function runtimeReadRoots(executables: string[]): string[] {
+  const roots = new Set<string>();
+  for (const executable of executables) {
+    let real: string;
+    try {
+      real = fs.realpathSync.native(executable);
+    } catch {
+      continue;
+    }
+    addExistingRoot(roots, path.dirname(real));
+    const prefix = path.dirname(path.dirname(real));
+    if (!isUnsafeSandboxReadRoot(prefix)) {
+      addExistingRoot(roots, prefix);
+      addExistingRoot(roots, path.join(prefix, "lib"));
+      addExistingRoot(roots, path.join(prefix, "share"));
+    }
+  }
+  for (const wellKnown of [
+    "/usr/lib",
+    "/usr/local/lib",
+    "/usr/local/share",
+    "/opt/homebrew/lib",
+    "/opt/homebrew/share",
+    "/opt/homebrew/Cellar",
+    "/System/Library",
+    "/Library/Developer",
+    "/Library/Frameworks",
+    path.join(os.homedir(), ".foundry"),
+    path.join(os.homedir(), ".svm"),
+    path.join(os.homedir(), ".bun"),
+  ]) {
+    addExistingRoot(roots, wellKnown);
+  }
+  return [...roots];
+}
+
 function walkRegularFiles(root: string): { abs: string; rel: string; key: string; sensitive: boolean }[] {
   const files: { abs: string; rel: string; key: string; sensitive: boolean }[] = [];
   const stack = [root];
@@ -107,8 +200,17 @@ export function createPocSandbox(input: {
   const executables = [executable, ...(input.extraExecutables ?? [])]
     .map((item) => fs.realpathSync.native(item))
     .filter((item, index, all) => all.indexOf(item) === index);
-  const runtimeRoots = executables.map((item) => path.dirname(path.dirname(item)));
+  const runtimeRoots = runtimeReadRoots(executables);
+  if (runtimeRoots.some((root) => isUnsafeSandboxReadRoot(root))) {
+    throw new PocSandboxError("POC_SANDBOX_UNAVAILABLE", "POC sandbox refused a filesystem-wide read root");
+  }
   const sensitive = sensitivePathsAndAliases(input.workspace);
+  const metadataRoots = metadataAllowRoots([
+    input.workspace.root,
+    writeRoot,
+    ...executables,
+    ...runtimeRoots,
+  ]);
 
   const profile = [
     "(version 1)",
@@ -116,10 +218,10 @@ export function createPocSandbox(input: {
     '(import "system.sb")',
     "(allow process-fork)",
     `(allow process-exec ${executables.map((item) => `(literal ${sbplString(item)})`).join(" ")})`,
+    `(allow file-read-metadata ${metadataRoots.map((root) => `(literal ${sbplString(root)})`).join(" ")})`,
     `(allow file-read* (subpath ${sbplString(input.workspace.root)}))`,
     ...runtimeRoots.map((root) => `(allow file-read* (subpath ${sbplString(root)}))`),
     `(allow file-read* file-write* (subpath ${sbplString(writeRoot)}))`,
-    `(allow file-read* file-write* (subpath ${sbplString(pocDir)}))`,
     "(deny network*)",
     '(deny file-read* file-write* (regex #"(^|/)\\.env($|\\.)"))',
     '(deny file-read* file-write* (regex #"(^|/)(\\.git|\\.ssh|\\.aws|\\.gnupg|\\.cloudflared|keystore|keystores|wallet|wallets|secrets|credentials|deploy-secrets|production-secrets|prod-secrets)(/|$)"))',
@@ -129,6 +231,9 @@ export function createPocSandbox(input: {
       (item) => `(deny file-read* file-write* (literal ${sbplString(item)}))`
     ),
   ].join("\n");
+  if (/\(subpath\s+"\/(?:private)?"\)/.test(profile)) {
+    throw new PocSandboxError("POC_SANDBOX_UNAVAILABLE", "POC sandbox refused a filesystem-wide read root");
+  }
   const profileFile = path.join(pocDir, `sandbox-${process.pid}-${randomBytes(8).toString("hex")}.sb`);
   fs.writeFileSync(profileFile, profile, { mode: 0o600 });
   fs.chmodSync(profileFile, 0o600);

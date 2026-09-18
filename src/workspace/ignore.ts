@@ -90,12 +90,56 @@ export const NOISE_PATTERNS: string[] = [
   "yarn.lock",
 ];
 
+export function fileInodeKey(absPath: string): string | null {
+  try {
+    const stat = fs.lstatSync(absPath);
+    return stat.isFile() ? `${stat.dev}:${stat.ino}` : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Collect inodes of regular files whose workspace-relative path matches.
+ * Symlinks are ignored so a name check cannot be redirected outside the tree.
+ */
+export function collectMatchingInodes(root: string, match: (relPath: string) => boolean): Set<string> {
+  const inodes = new Set<string>();
+  const stack = [root];
+  while (stack.length > 0) {
+    const dir = stack.pop()!;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (entry.isSymbolicLink()) continue;
+      const abs = path.join(dir, entry.name);
+      const rel = path.relative(root, abs).split(path.sep).join("/");
+      if (entry.isDirectory()) {
+        if (entry.name === ".git") continue;
+        stack.push(abs);
+        continue;
+      }
+      if (!entry.isFile() || !match(rel)) continue;
+      const key = fileInodeKey(abs);
+      if (key) inodes.add(key);
+    }
+  }
+  return inodes;
+}
+
 export class IgnoreRules {
+  private readonly root: string;
   private sensitive: Ignore;
   private noise: Ignore;
   private custom: Ignore;
+  private sensitiveInodes: Set<string>;
 
   constructor(workspaceRoot: string) {
+    this.root = workspaceRoot;
     this.sensitive = ignore().add(SENSITIVE_PATTERNS);
     this.noise = ignore().add(NOISE_PATTERNS);
     this.custom = ignore();
@@ -107,12 +151,35 @@ export class IgnoreRules {
     } catch {
       // unreadable .c2cignore: fall back to defaults only
     }
+    this.sensitiveInodes = collectMatchingInodes(workspaceRoot, (rel) => this.nameIsSensitive(rel));
+  }
+
+  private nameIsSensitive(relPath: string): boolean {
+    return this.sensitive.ignores(relPath) || this.custom.ignores(relPath);
+  }
+
+  private matchesSensitiveInode(relPath: string): boolean {
+    const abs = path.join(this.root, relPath);
+    const key = fileInodeKey(abs);
+    if (!key) return false;
+    if (this.sensitiveInodes.has(key)) return true;
+    let nlink = 1;
+    try {
+      nlink = fs.lstatSync(abs).nlink;
+    } catch {
+      return false;
+    }
+    if (nlink <= 1) return false;
+    for (const inode of collectMatchingInodes(this.root, (rel) => this.nameIsSensitive(rel))) {
+      this.sensitiveInodes.add(inode);
+    }
+    return this.sensitiveInodes.has(key);
   }
 
   /** True when the path must be denied with ACCESS_DENIED_SENSITIVE_FILE. */
   isSensitive(relPath: string): boolean {
     if (!relPath || relPath === ".") return false;
-    return this.sensitive.ignores(relPath) || this.custom.ignores(relPath);
+    return this.nameIsSensitive(relPath) || this.matchesSensitiveInode(relPath);
   }
 
   /** True when the path should be hidden from listing/search (not an error). */

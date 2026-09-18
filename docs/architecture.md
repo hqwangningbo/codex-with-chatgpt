@@ -39,7 +39,7 @@ MCP: ChatGPT → HTTPS Tunnel → `/mcp` → Bearer validation (401/403) → OAu
 scope check → handler → Workspace containment/filtering → bounded result.
 Mutable handlers additionally require a machine-local Writable Root bound to
 the current Bridge session. `run_poc` uses a macOS Seatbelt profile with no
-network and write access limited to that root.
+network, Workspace/runtime reads, and write access limited to that root.
 
 OAuth: protected-resource discovery → dynamic client registration →
 authorization + user-entered one-time pairing code → PKCE token exchange.
