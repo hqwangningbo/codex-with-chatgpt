@@ -16,6 +16,8 @@ export type DevErrorCode =
   | "DEV_NOT_RUNNING"
   | "DEV_STOP_PID_UNCERTAIN"
   | "DEV_STOP_TIMEOUT"
+  | "DEV_ROLLBACK_FAILED"
+  | "DEV_RESTART_REQUIRED"
   | "DEV_UP_FAILED"
   | "DEV_PROTOCOL_INVALID"
   | "POC_NOT_ALLOWED";
@@ -23,9 +25,22 @@ export type DevErrorCode =
 export class DevError extends Error {
   constructor(
     public readonly code: DevErrorCode,
-    message: string
+    message: string,
+    public readonly original?: { code: string; message: string },
+    public readonly rollback?: { code: string; message: string }
   ) {
     super(message);
     this.name = "DevError";
   }
+}
+
+export function errorCodeOf(error: unknown): string {
+  if (error && typeof error === "object" && "code" in error && (error as { code: unknown }).code) {
+    return String((error as { code: unknown }).code);
+  }
+  return "INTERNAL_ERROR";
+}
+
+export function errorMessageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

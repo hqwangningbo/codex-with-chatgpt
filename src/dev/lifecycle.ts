@@ -8,9 +8,9 @@ import { adminFetch, startTunnelAndVerify } from "../process/daemon.js";
 import { detectTunnelBinaries } from "../tunnel/detect.js";
 import { needsTunnelChoice, readTunnelState } from "../tunnel/state.js";
 import type { RuntimeState } from "../bridge/runtime.js";
-import { observeWebTask, stopWebTask } from "../web/state.js";
+import { observeWebTask, stopWebTask, inspectProcess } from "../web/state.js";
 import { WebError } from "../web/errors.js";
-import { DevError } from "./errors.js";
+import { DevError, errorCodeOf, errorMessageOf } from "./errors.js";
 import {
   captureDevCapability,
   createDevEnvironment,
@@ -21,11 +21,12 @@ import {
   capabilityFromRuntime,
   clearDevRuntime,
   findDevObservation,
+  isProvenDevOwner,
   readDevRuntime,
   writeDevRuntime,
   type DevRuntimeState,
 } from "./runtime.js";
-import { tunnelIdentityFor, type DevProfile } from "./profile.js";
+import { environmentIdFor, profileHash, tunnelIdentityFor, type DevProfile } from "./profile.js";
 import type { MountAccess } from "./mounts.js";
 
 export const DEV_STOP_WAIT_MS = 10_000;
@@ -81,7 +82,17 @@ export async function ensureEnvironmentRunning(profile: DevProfile): Promise<{
   spawned: boolean;
 }> {
   const observation = await findDevObservation(profile.name);
-  if (observation.state === "healthy") return { runtime: observation.runtime, spawned: false };
+  if (observation.state === "healthy") {
+    const expectedId = environmentIdFor(profile);
+    const expectedHash = profileHash(profile);
+    if (observation.runtime.environmentId !== expectedId || observation.runtime.profileHash !== expectedHash) {
+      throw new DevError(
+        "DEV_RESTART_REQUIRED",
+        `Saved profile differs from the running Development Environment.\nRun:\nc2c dev down ${profile.name}\nc2c dev up ${profile.name}`
+      );
+    }
+    return { runtime: observation.runtime, spawned: false };
+  }
   if (observation.state === "unknown") {
     throw new DevError(
       "DEV_STOP_PID_UNCERTAIN",
@@ -101,6 +112,8 @@ export async function ensureEnvironmentRunning(profile: DevProfile): Promise<{
     adminToken: "",
     publicUrl: null,
     status: "starting",
+    processStartedAt: null,
+    commandHash: null,
   });
 
   const logDir = ensureDir(path.join(getStateDir(), "logs"));
@@ -161,9 +174,13 @@ export async function stopDevTunnel(name: string): Promise<void> {
   if (latest) writeDevRuntime({ ...latest, publicUrl: null });
 }
 
-export async function rollbackThisUp(name: string, spawned: DevUpSpawned): Promise<void> {
+export async function rollbackThisUp(
+  name: string,
+  spawned: DevUpSpawned,
+  opts: { waitMs?: number } = {}
+): Promise<void> {
   if (spawned.bridge) {
-    await downDevEnvironment(name, { ignoreChat: true });
+    await downDevEnvironment(name, { ignoreChat: true, waitMs: opts.waitMs });
     return;
   }
   if (spawned.tunnel) {
@@ -200,6 +217,7 @@ export async function upDevEnvironment(input: {
     runtime: DevRuntimeState;
     publicVerification: "direct" | "system-proxy";
   }>;
+  waitMs?: number;
 }): Promise<{
   runtime: DevRuntimeState;
   spawned: boolean;
@@ -243,12 +261,46 @@ export async function upDevEnvironment(input: {
   } catch (error) {
     if (!chatReady && (started.bridge || started.tunnel)) {
       try {
-        await rollbackThisUp(input.profile.name, started);
-      } catch {
-        // Preserve the original failure. down already refuses to clear an unproven runtime.
+        await rollbackThisUp(input.profile.name, started, { waitMs: input.waitMs });
+      } catch (rollbackError) {
+        throw new DevError(
+          "DEV_ROLLBACK_FAILED",
+          `DEV_ROLLBACK_FAILED: original=${errorCodeOf(error)} rollback=${errorCodeOf(rollbackError)}`,
+          { code: errorCodeOf(error), message: errorMessageOf(error) },
+          { code: errorCodeOf(rollbackError), message: errorMessageOf(rollbackError) }
+        );
       }
     }
     throw error;
+  }
+}
+
+async function assertProvenDevBridge(runtime: DevRuntimeState): Promise<void> {
+  let info: { environmentId?: string; pid?: number; startedAt?: string };
+  try {
+    info = await adminFetch(asBridgeRuntime(runtime), "GET", "/admin/info", 5000);
+  } catch {
+    throw new DevError(
+      "DEV_STOP_PID_UNCERTAIN",
+      "Environment admin identity could not be proven; refusing to signal it"
+    );
+  }
+  if (
+    info.environmentId !== runtime.environmentId ||
+    info.pid !== runtime.pid ||
+    info.startedAt !== runtime.devStartedAt
+  ) {
+    throw new DevError(
+      "DEV_STOP_PID_UNCERTAIN",
+      "Environment admin identity mismatch; refusing to signal the recorded PID"
+    );
+  }
+  const live = inspectProcess(runtime.pid);
+  if (!isProvenDevOwner(runtime, live)) {
+    throw new DevError(
+      "DEV_STOP_PID_UNCERTAIN",
+      "Environment PID is live but is not a proven serve-dev owner; refusing to signal it"
+    );
   }
 }
 
@@ -289,6 +341,7 @@ export async function downDevEnvironment(
   }
 
   const live = observation.runtime;
+  await assertProvenDevBridge(live);
   try {
     await adminFetch(asBridgeRuntime(live), "POST", "/admin/tunnel/stop", 5000).catch(() => undefined);
     await adminFetch(asBridgeRuntime(live), "POST", "/admin/revoke-all", 5000).catch(() => undefined);

@@ -104,13 +104,17 @@ export function registerDevCommands(program: Command, helpers: CliHelpers): void
             mode: opts.mode,
             save: opts.save,
           });
-          const mounts = resolvedMounts(profile);
           const result = await upDevEnvironment({
             profile,
             tunnel: opts.tunnel,
             startChat: opts.chat
               ? async ({ env, runtime, localMcpUrl, publicMcpUrl, markChatReady }) => {
                   const printReadyBanner = (sessionId?: string): void => {
+                    const views = runtime.mounts.map((mount) => ({
+                      alias: mount.alias,
+                      access: mount.access,
+                      mode: mount.access === "ro" ? "read-only" : runtime.mode,
+                    }));
                     if (opts.json) {
                       say(
                         JSON.stringify({
@@ -118,7 +122,7 @@ export function registerDevCommands(program: Command, helpers: CliHelpers): void
                           environmentId: runtime.environmentId,
                           localMcpUrl,
                           publicMcpUrl,
-                          mounts: mounts.map((mount) => publicMountView(mount, profile.mode)),
+                          mounts: views,
                           chat: { status: "ready", sessionId: sessionId ?? null },
                         })
                       );
@@ -135,8 +139,8 @@ export function registerDevCommands(program: Command, helpers: CliHelpers): void
                     }
                     say("");
                     say("Workspaces:");
-                    for (const mount of mounts) {
-                      say(`${mount.alias.padEnd(12)} ${accessLabel(mount.access, profile.mode)}`);
+                    for (const mount of runtime.mounts) {
+                      say(`${mount.alias.padEnd(12)} ${accessLabel(mount.access, runtime.mode)}`);
                     }
                     say("");
                     say("Web Chat:");
@@ -195,10 +199,10 @@ export function registerDevCommands(program: Command, helpers: CliHelpers): void
                 environmentId: result.runtime.environmentId,
                 localMcpUrl: result.localMcpUrl,
                 publicMcpUrl: result.publicMcpUrl,
-                mounts: mounts.map((mount) => ({
+                mounts: result.runtime.mounts.map((mount) => ({
                   alias: mount.alias,
                   access: mount.access,
-                  mode: mount.access === "ro" ? "read-only" : profile.mode,
+                  mode: mount.access === "ro" ? "read-only" : result.runtime.mode,
                 })),
                 chat: { status: "idle" },
               })
@@ -216,8 +220,8 @@ export function registerDevCommands(program: Command, helpers: CliHelpers): void
           }
           say("");
           say("Workspaces:");
-          for (const mount of mounts) {
-            say(`${mount.alias.padEnd(12)} ${accessLabel(mount.access, profile.mode)}`);
+          for (const mount of result.runtime.mounts) {
+            say(`${mount.alias.padEnd(12)} ${accessLabel(mount.access, result.runtime.mode)}`);
           }
           say("");
           say("Stop:");

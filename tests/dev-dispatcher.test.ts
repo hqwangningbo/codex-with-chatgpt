@@ -36,6 +36,8 @@ function persist(env: ReturnType<typeof createDevEnvironment>) {
     adminToken: "test",
     publicUrl: null,
     status: "running",
+    processStartedAt: null,
+    commandHash: null,
   });
 }
 

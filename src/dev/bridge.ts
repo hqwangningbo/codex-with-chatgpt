@@ -15,7 +15,7 @@ import { Logger, nullLogger } from "../logger/index.js";
 import { DEFAULT_HOST, DEFAULT_PORT } from "../config/paths.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
 import { captureDevCapability, type DevEnvironment } from "./environment.js";
-import { clearDevRuntime, writeDevRuntime, type DevRuntimeState } from "./runtime.js";
+import { writeDevRuntime, readDevRuntime, clearDevRuntime, ownerIdentityFor, type DevRuntimeState } from "./runtime.js";
 import { tunnelIdentityFor } from "./profile.js";
 
 export function tunnelForDevProfile(name: string, logger: Logger = nullLogger): TunnelProvider {
@@ -217,6 +217,7 @@ export async function startEnvironmentBridge(opts: {
 
   const persistRuntime = (): void => {
     if (opts.persistRuntime === false) return;
+    const previous = readDevRuntime(env.name);
     const state: DevRuntimeState = {
       service: SERVICE_NAME,
       version: VERSION,
@@ -226,6 +227,7 @@ export async function startEnvironmentBridge(opts: {
       adminToken,
       publicUrl: publicBaseUrl,
       status: "running",
+      ...ownerIdentityFor(process.pid, previous),
     };
     writeDevRuntime(state);
   };

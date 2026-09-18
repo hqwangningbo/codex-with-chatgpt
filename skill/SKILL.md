@@ -376,7 +376,9 @@ Behavior:
 
 7. `dev up` is the write authorization for attached rw mounts. Do not also
    run `c2c write-scope set` for this path. Profile edits do not enlarge a
-   running session; the user must `dev down` then `dev up`.
+   running session. If `c2c dev up` returns `DEV_RESTART_REQUIRED`, run
+   `c2c dev down <name>` then `c2c dev up <name>`. Do not print the new
+   saved Profile as if it were already live.
 
 8. First-time public access uses this profile's Named Tunnel identity, not
    the Daily Bridge workspace tunnel:
