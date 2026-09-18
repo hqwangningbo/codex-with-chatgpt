@@ -77,8 +77,8 @@ export function registerWebCommands(program: Command, helpers: CliHelpers): void
       profileExists: webProfileExists(),
       authenticated: statusAuthenticated(),
       browserRunning: Boolean(task && pidAlive(task.pid)),
-      activeResearchTask: task
-        ? { requestId: task.requestId, workspaceId: task.workspaceId, stepCount: task.stepCount, status: task.status }
+      activeWebTask: task
+        ? { kind: task.kind, workspaceId: task.workspaceId, status: task.status }
         : null,
       status: runtime.status,
     };
@@ -88,7 +88,7 @@ export function registerWebCommands(program: Command, helpers: CliHelpers): void
     }
     say(`Profile：${payload.profileExists ? "present" : "missing"}`);
     say(`Browser：${payload.browserRunning ? "running" : "stopped"}`);
-    say(`Research：${payload.activeResearchTask ? payload.activeResearchTask.status : "idle"}`);
+    say(`Harness：${payload.activeWebTask ? `${payload.activeWebTask.kind ?? "unknown"} ${payload.activeWebTask.status}` : "idle"}`);
   });
 
   web
@@ -164,6 +164,63 @@ export function registerWebCommands(program: Command, helpers: CliHelpers): void
       }
     );
 
+  web
+    .command("chat")
+    .description("Open an interactive ChatGPT Web chat against the current Workspace")
+    .option("-w, --workspace <path>")
+    .option("--model <name>", "current", "current")
+    .option("--json", "machine-readable output", false)
+    .action(async (opts: { workspace?: string; model: string; json: boolean }) => {
+      try {
+        if (opts.model !== "current") {
+          throw new WebError("WEB_MODEL_UNAVAILABLE", "V1 only supports --model current");
+        }
+        const workspace = new Workspace(resolveWorkspace(opts.workspace));
+        const { assertBridgeForStoredScope } = await import("../web/dispatcher.js");
+        await assertBridgeForStoredScope(workspace);
+        const { openChatSession } = await import("../web/session.js");
+        const { runWebChat } = await import("../web/chat-turn.js");
+        const { session } = await openChatSession({ workspaceRoot: workspace.root });
+        const ac = new AbortController();
+        const onAbort = (): void => ac.abort();
+        process.on("SIGINT", onAbort);
+        process.on("SIGTERM", onAbort);
+        try {
+          const result = await runWebChat({
+            workspace,
+            session,
+            signal: ac.signal,
+            onReady: (info) => {
+              if (opts.json) {
+                say(JSON.stringify({ ok: true, ready: true, kind: "chat", sessionId: info.sessionId }));
+                return;
+              }
+              say("Web Chat ready.");
+              say("请直接在打开的 ChatGPT 页面聊天。");
+              say("Ctrl+C 或 `c2c web stop` 可停止。");
+            },
+          });
+          if (opts.json) {
+            say(JSON.stringify({ ok: result.status === "interrupted" && !result.error, ...result }));
+            if (result.status === "failed") process.exitCode = 1;
+            return;
+          }
+          if (result.status === "failed") {
+            throw new WebError(
+              (result.error?.code as never) ?? "WEB_PROTOCOL_INVALID",
+              result.error?.message ?? "Web Chat failed"
+            );
+          }
+        } finally {
+          process.off("SIGINT", onAbort);
+          process.off("SIGTERM", onAbort);
+          await session.close();
+        }
+      } catch (error) {
+        handleCliError(error, opts.json);
+      }
+    });
+
   acceptUnusedWorkspaceOption(
     web
       .command("stop")
@@ -190,7 +247,7 @@ export function registerWebCommands(program: Command, helpers: CliHelpers): void
       if (!opts.yes) {
         throw new WebError("WEB_LOGOUT_REQUIRES_YES", "Pass --yes to delete the C2C Browser Profile");
       }
-      if (activeWebTask()) throw new WebError("WEB_RESEARCH_BUSY", "Stop the research task before logout");
+      if (activeWebTask()) throw new WebError("WEB_RESEARCH_BUSY", "Stop the web session before logout");
       if (observeWebTask().state === "unknown") {
         throw new WebError("WEB_STOP_PID_UNCERTAIN", "A recorded PID is live but unproven; refusing to delete the profile");
       }

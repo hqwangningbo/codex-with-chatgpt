@@ -9,7 +9,7 @@ import { Workspace } from "../src/workspace/manager.js";
 import type { ChatSession } from "../src/web/session.js";
 import type { ChatGptSnapshot } from "../src/web/selectors.js";
 import { ACTION_CLOSE, ACTION_OPEN, WEB_PROTOCOL } from "../src/web/protocol.js";
-import { inspectProcess, isWebResearchCommand, readWebRuntime, stopWebTask, writeWebRuntime } from "../src/web/state.js";
+import { inspectProcess, isWebHarnessCommand, isWebResearchCommand, readWebRuntime, stopWebTask, writeWebRuntime } from "../src/web/state.js";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const cliEntry = path.join(projectRoot, "src/cli/index.ts");
@@ -80,6 +80,14 @@ describe("web CLI isolation", () => {
     const missing = runCli(["web", "research", "--json", "-w", workspace, "--task", "demo"]);
     expect(missing.status).not.toBe(0);
     expect(missing.stdout).toMatch(/WEB_PROFILE_REQUIRED/);
+    expect(fs.existsSync(path.join(stateDir, "web-profile"))).toBe(false);
+
+    const chatModel = runCli(["web", "chat", "--json", "-w", workspace, "--model", "high"]);
+    expect(chatModel.status).not.toBe(0);
+    expect(chatModel.stdout).toMatch(/WEB_MODEL_UNAVAILABLE/);
+    const chatMissing = runCli(["web", "chat", "--json", "-w", workspace]);
+    expect(chatMissing.status).not.toBe(0);
+    expect(chatMissing.stdout).toMatch(/WEB_PROFILE_REQUIRED/);
     expect(fs.existsSync(path.join(stateDir, "web-profile"))).toBe(false);
   });
 
@@ -153,7 +161,10 @@ describe("web stop PID identity", () => {
   });
 });
 
-function spawnFakeWebOwner(ignoreTerm: boolean): { child: ReturnType<typeof spawn>; dir: string; ready: string } {
+function spawnFakeWebOwner(
+  ignoreTerm: boolean,
+  subcommand: "research" | "chat" = "research"
+): { child: ReturnType<typeof spawn>; dir: string; ready: string } {
   const dir = makeTmpDir("web-owner");
   fs.mkdirSync(path.join(dir, "cli"), { recursive: true });
   const ready = path.join(dir, "ready");
@@ -164,7 +175,7 @@ setInterval(() => {}, 1000);
 `;
   const file = path.join(dir, "cli", "index.js");
   fs.writeFileSync(file, script);
-  const child = spawn(process.execPath, [file, "web", "research"], { stdio: "ignore", detached: true });
+  const child = spawn(process.execPath, [file, "web", subcommand], { stdio: "ignore", detached: true });
   child.unref();
   if (!child.pid) throw new Error("failed to spawn helper");
   return { child, dir, ready };
@@ -183,7 +194,7 @@ async function recordFakeOwner(child: ReturnType<typeof spawn>): Promise<void> {
   if (!child.pid) throw new Error("failed to spawn helper");
   const live = inspectProcess(child.pid);
   expect(live.alive).toBe(true);
-  expect(isWebResearchCommand(live.command)).toBe(true);
+  expect(isWebHarnessCommand(live.command)).toBe(true);
   writeWebRuntime({
     pid: child.pid,
     requestId: "c2c_wr_owner",
@@ -249,6 +260,59 @@ describe("web stop waits for owner exit", () => {
       }
       cleanup(dir);
     }
+  });
+
+  it("waits for a proven web chat owner the same way as research", async () => {
+    process.env.C2C_STATE_DIR = stateDir;
+    const { child, dir, ready } = spawnFakeWebOwner(true, "chat");
+    try {
+      await waitForFile(ready);
+      await recordFakeOwner(child);
+      expect(isWebResearchCommand(inspectProcess(child.pid!).command)).toBe(false);
+      expect(isWebHarnessCommand(inspectProcess(child.pid!).command)).toBe(true);
+      await expect(stopWebTask({ waitMs: 400 })).rejects.toMatchObject({ code: "WEB_STOP_TIMEOUT" });
+      expect(readWebRuntime().status).toBe("running");
+      expect(() => process.kill(child.pid!, 0)).not.toThrow();
+    } finally {
+      if (child.pid) {
+        try {
+          process.kill(child.pid, "SIGKILL");
+        } catch {
+          /* ignore */
+        }
+      }
+      cleanup(dir);
+    }
+  });
+
+  it("marks a chat owner interrupted only after it actually exits", async () => {
+    process.env.C2C_STATE_DIR = stateDir;
+    const { child, dir, ready } = spawnFakeWebOwner(false, "chat");
+    try {
+      await waitForFile(ready);
+      await recordFakeOwner(child);
+      await expect(stopWebTask({ waitMs: 2000 })).resolves.toMatchObject({ ok: true, stopped: true });
+      expect(readWebRuntime().status).toBe("interrupted");
+      expect(readWebRuntime().pid).toBeNull();
+    } finally {
+      if (child.pid) {
+        try {
+          process.kill(child.pid, "SIGKILL");
+        } catch {
+          /* ignore */
+        }
+      }
+      cleanup(dir);
+    }
+  });
+});
+
+describe("web harness command identity", () => {
+  it("matches web research and web chat, not web stop", () => {
+    expect(isWebHarnessCommand("node src/cli/index.ts web research --task x")).toBe(true);
+    expect(isWebHarnessCommand("node src/cli/index.js web chat -w /tmp")).toBe(true);
+    expect(isWebHarnessCommand("node src/cli/index.ts web stop --json")).toBe(false);
+    expect(isWebResearchCommand("node src/cli/index.js web chat")).toBe(false);
   });
 });
 

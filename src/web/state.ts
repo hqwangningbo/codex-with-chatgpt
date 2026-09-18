@@ -6,10 +6,13 @@ import { webRuntimeDir } from "./profile.js";
 import { WebError } from "./errors.js";
 
 export type WebTaskStatus = "idle" | "running" | "interrupted" | "completed" | "failed";
+export type WebHarnessKind = "research" | "chat";
 
 export interface WebRuntimeState {
   pid: number | null;
   requestId: string | null;
+  sessionId: string | null;
+  kind: WebHarnessKind | null;
   workspaceId: string | null;
   startedAt: string | null;
   processStartedAt: string | null;
@@ -32,6 +35,8 @@ export type WebTaskObservation =
 const EMPTY: WebRuntimeState = {
   pid: null,
   requestId: null,
+  sessionId: null,
+  kind: null,
   workspaceId: null,
   startedAt: null,
   processStartedAt: null,
@@ -52,6 +57,8 @@ export function readWebRuntime(): WebRuntimeState {
     ...raw,
     processStartedAt: raw.processStartedAt ?? null,
     command: raw.command ?? null,
+    sessionId: raw.sessionId ?? null,
+    kind: raw.kind === "chat" || raw.kind === "research" ? raw.kind : null,
   };
 }
 
@@ -120,10 +127,19 @@ function normalizePsField(value: string | null | undefined): string | null {
 }
 
 export function isWebResearchCommand(command: string | null): boolean {
+  return isHarnessSubcommand(command, "research");
+}
+
+export function isWebHarnessCommand(command: string | null): boolean {
+  return isHarnessSubcommand(command, "research") || isHarnessSubcommand(command, "chat");
+}
+
+function isHarnessSubcommand(command: string | null, subcommand: "research" | "chat"): boolean {
   if (!command) return false;
   const text = command.toLowerCase();
   const harness = text.includes("c2c") || text.includes("cli/index.ts") || text.includes("cli/index.js");
-  return harness && /\bweb\b/.test(text) && /\bresearch\b/.test(text);
+  if (!harness) return false;
+  return new RegExp(`\\bweb\\s+${subcommand}\\b`).test(text);
 }
 
 export function isProvenWebOwner(state: WebRuntimeState, live: ProcessIdentity): boolean {
@@ -131,7 +147,7 @@ export function isProvenWebOwner(state: WebRuntimeState, live: ProcessIdentity):
   if (!live.alive) return false;
   if (!state.processStartedAt || !live.startedAt) return false;
   if (state.processStartedAt !== live.startedAt) return false;
-  if (!isWebResearchCommand(state.command) || !isWebResearchCommand(live.command)) return false;
+  if (!isWebHarnessCommand(state.command) || !isWebHarnessCommand(live.command)) return false;
   return true;
 }
 
@@ -175,8 +191,8 @@ export function activeWebTask(): WebRuntimeState | null {
 }
 
 export function writeWebRuntime(
-  state: Omit<WebRuntimeState, "processStartedAt" | "command"> &
-    Partial<Pick<WebRuntimeState, "processStartedAt" | "command">>
+  state: Omit<WebRuntimeState, "processStartedAt" | "command" | "kind" | "sessionId"> &
+    Partial<Pick<WebRuntimeState, "processStartedAt" | "command" | "kind" | "sessionId">>
 ): void {
   fs.mkdirSync(webRuntimeDir(), { recursive: true, mode: 0o700 });
   writeSecureJson(
@@ -224,7 +240,7 @@ export async function stopWebTask(opts?: { waitMs?: number }): Promise<{ ok: tru
   if (!isProvenWebOwner(runtime, live)) {
     throw new WebError(
       "WEB_STOP_PID_UNCERTAIN",
-      "Recorded PID is live but is not a proven Web Research owner; refusing to signal it"
+      "Recorded PID is live but is not a proven Web Harness owner; refusing to signal it"
     );
   }
   try {

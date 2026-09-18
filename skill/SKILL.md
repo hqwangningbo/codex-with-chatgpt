@@ -262,21 +262,28 @@ To close access, run:
 Optional. Manual Safe Mode remains the default. Do not start this path for
 ordinary planning, review, Bridge, or Connector work.
 
-Natural-language triggers:
+Natural-language triggers for a one-shot research task:
 
 - “用网页版 ChatGPT 研究这个项目”
 - “让 ChatGPT Web 做 Research”
 - “用 Pro 网页额度研究”
 - “让网页版 ChatGPT 研究并沉淀文档”
 
+Natural-language triggers for interactive Web Chat:
+
+- “打开网页版 ChatGPT 直接聊这个项目”
+- “让我直接在 ChatGPT 网页里研究”
+- “开启 ChatGPT Web Chat”
+- “直接跟网页版 ChatGPT 聊并操作项目”
+
 Behavior:
 
 1. Resolve `<workspace>` the same way as Daily Bridge lifecycle.
-2. If the user did not ask for Web Research, do not run `c2c web`.
+2. If the user did not ask for Web Research or Web Chat, do not run `c2c web`.
 3. Never run `c2c web` as a side effect of `c2c start`.
 4. Run `c2c web status --json`. If `profileExists` is false, tell the user to
    run `c2c web login` themselves and wait. Do not type their password.
-5. Read-only research may start without Writable Scope.
+5. Read-only research or chat may start without Writable Scope.
 6. If the user wants written documents, file changes, or a POC, first run
    `c2c write-scope status -w <workspace> --json`. If it is inactive, do not
    grant access. Tell them to set an explicit Workspace-relative root:
@@ -289,12 +296,18 @@ Behavior:
    intent, then and only then guide:
 
    `c2c write-scope set -w <workspace> --root . --mode poc --allow-workspace-root --yes`
-8. Mutable Web Research also needs a live Bridge. If write-scope status is
-   active but Bridge is down, return `BRIDGE_NOT_RUNNING` and ask the user to
-   start it. Never start, restart, or stop Bridge from this Harness.
-9. Then run:
+8. Mutable Web Research or Chat also needs a live Bridge. If write-scope status
+   is active but Bridge is down, return `BRIDGE_NOT_RUNNING` and ask the user
+   to start it. Never start, restart, or stop Bridge from this Harness.
+9. For a one-shot automatic research task, run:
 
    `c2c web research -w <workspace> --task "<user task>" --model current`
+
+   For interactive chat in the ChatGPT page, prefer:
+
+   `c2c web chat -w <workspace> --model current`
+
+   Do not require a new `--task` for every follow-up question in Web Chat.
 
 `c2c web stop` stops only the Harness. It must not stop Bridge, clear Tunnel,
 or delete the browser profile. `c2c web logout --yes` deletes the dedicated

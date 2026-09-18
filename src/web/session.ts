@@ -7,10 +7,12 @@ import {
   classifyPage,
   extractChatGptSnapshot,
   sessionIsReady,
-  sendBaselineFrom,
   uniqueIds,
   watchSentTurn,
+  mergeSeenTurns,
+  EMPTY_SEND_BASELINE,
   type ChatGptSnapshot,
+  type SendBaseline,
   SELECTORS,
 } from "./selectors.js";
 import { SendGuard } from "./send-guard.js";
@@ -53,11 +55,11 @@ export function navigationDecision(url: string, mode: WebNavigationMode): Naviga
   if (parsed.protocol === "chrome:" || parsed.protocol === "edge:" || parsed.protocol === "devtools:") {
     return "ignore";
   }
-  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return "deny";
+  if (parsed.protocol !== "https:") return "deny";
   const host = parsed.hostname;
   if (!host) return "deny";
-  if (mode === "research") return allowedResearchHost(host) ? "allow" : "deny";
-  return allowedLoginHost(host) ? "allow" : "deny";
+  if (mode === "login") return allowedLoginHost(host) ? "allow" : "deny";
+  return allowedResearchHost(host) ? "allow" : "deny";
 }
 
 function assertAllowedUrl(url: string, mode: WebNavigationMode): void {
@@ -69,17 +71,27 @@ function assertAllowedUrl(url: string, mode: WebNavigationMode): void {
 export interface ChatSession {
   snapshot(): Promise<ChatGptSnapshot>;
   ensureReady(): Promise<ChatGptSnapshot>;
-  sendAndWait(text: string, opts?: { timeoutMs?: number; signal?: AbortSignal }): Promise<string>;
+  sendAndWait(text: string, opts?: SendWaitOptions): Promise<string>;
   close(): Promise<void>;
 }
 
+export interface InteractiveChatSession extends ChatSession {
+  waitForNextManualExchange(opts?: SendWaitOptions): Promise<string>;
+}
+
+export interface SendWaitOptions {
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  multipleUserTurns?: "ambiguous" | "concurrent";
+}
+
 async function waitForSignal(signal: AbortSignal | undefined, ms: number): Promise<void> {
-  if (signal?.aborted) throw new WebError("WEB_TIMEOUT", "Research was cancelled");
+  if (signal?.aborted) throw new WebError("WEB_TIMEOUT", "Web session was cancelled");
   await new Promise<void>((resolve, reject) => {
     const timer = setTimeout(resolve, ms);
     const onAbort = (): void => {
       clearTimeout(timer);
-      reject(new WebError("WEB_TIMEOUT", "Research was cancelled"));
+      reject(new WebError("WEB_TIMEOUT", "Web session was cancelled"));
     };
     signal?.addEventListener("abort", onAbort, { once: true });
   });
@@ -113,10 +125,11 @@ export async function openChatSession(input: {
   return { session, context, page };
 }
 
-export class PlaywrightChatSession implements ChatSession {
+export class PlaywrightChatSession implements InteractiveChatSession {
   private readonly sendGuard = new SendGuard();
   private readonly mode: WebNavigationMode;
   private drift: WebError | null = null;
+  private seen: SendBaseline = { ...EMPTY_SEND_BASELINE };
 
   constructor(
     private readonly context: BrowserContext,
@@ -177,7 +190,10 @@ export class PlaywrightChatSession implements ChatSession {
       const snapshot = await this.snapshot();
       const kind = classifyPage(snapshot);
       if (kind === "challenge" || kind === "rate_limit" || kind === "usage_limit") failFromSnapshot(snapshot);
-      if (sessionIsReady(snapshot)) return snapshot;
+      if (sessionIsReady(snapshot)) {
+        this.seen = mergeSeenTurns(this.seen, snapshot);
+        return snapshot;
+      }
       if (!this.loginMode && kind === "login") failFromSnapshot(snapshot);
       if (!this.loginMode && kind === "drift") failFromSnapshot(snapshot);
       await this.page.waitForTimeout(750);
@@ -185,26 +201,13 @@ export class PlaywrightChatSession implements ChatSession {
     throw new WebError("WEB_SESSION_NOT_READY", "Could not confirm an authenticated Temporary Chat");
   }
 
-  async sendAndWait(text: string, opts: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<string> {
+  async sendAndWait(text: string, opts: SendWaitOptions = {}): Promise<string> {
     this.throwIfDrifted();
     this.sendGuard.assertCanSend();
     const before = await this.snapshot();
     if (!sessionIsReady(before)) failFromSnapshot(before);
-    const baselineContainers = uniqueIds(before.turnContainerIds);
-    if (!baselineContainers.ok && before.turnContainerIds.length > 0) {
-      throw new WebError(
-        baselineContainers.reason === "duplicate" ? "WEB_TURN_AMBIGUOUS" : "WEB_TURN_STATE_UNKNOWN",
-        "ChatGPT turn containers were not unique before send; refusing to send"
-      );
-    }
-    const baselineAssistants = uniqueIds(before.assistantTurnIds);
-    if (!baselineAssistants.ok && before.assistantTurnIds.length > 0) {
-      throw new WebError(
-        baselineAssistants.reason === "duplicate" ? "WEB_TURN_AMBIGUOUS" : "WEB_TURN_STATE_UNKNOWN",
-        "ChatGPT assistant turns were not unique before send; refusing to send"
-      );
-    }
-    const baseline = sendBaselineFrom(before);
+    this.assertUniqueVisibleTurns(before);
+    const baseline = mergeSeenTurns(this.seen, before);
     const composer = this.page.locator(SELECTORS.composer).first();
     await composer.click();
     await composer.fill(text);
@@ -212,32 +215,91 @@ export class PlaywrightChatSession implements ChatSession {
     await send.click();
     this.sendGuard.markSent();
 
-    const timeoutMs = opts.timeoutMs ?? 10 * 60_000;
-    const deadline = Date.now() + timeoutMs;
+    const textReply = await this.waitForBoundExchange(baseline, opts, "send");
+    this.sendGuard.markAcknowledged();
+    return textReply;
+  }
+
+  async waitForNextManualExchange(opts: SendWaitOptions = {}): Promise<string> {
+    this.throwIfDrifted();
+    const before = await this.snapshot();
+    if (!sessionIsReady(before)) failFromSnapshot(before);
+    this.assertUniqueVisibleTurns(before);
+    const baseline = mergeSeenTurns(this.seen, before);
+    return this.waitForBoundExchange(
+      baseline,
+      { ...opts, multipleUserTurns: opts.multipleUserTurns ?? "concurrent", timeoutMs: opts.timeoutMs ?? 0 },
+      "manual"
+    );
+  }
+
+  private assertUniqueVisibleTurns(snapshot: ChatGptSnapshot): void {
+    const baselineContainers = uniqueIds(snapshot.turnContainerIds);
+    if (!baselineContainers.ok && snapshot.turnContainerIds.length > 0) {
+      throw new WebError(
+        baselineContainers.reason === "duplicate" ? "WEB_TURN_AMBIGUOUS" : "WEB_TURN_STATE_UNKNOWN",
+        "ChatGPT turn containers were not unique; refusing to continue"
+      );
+    }
+    const baselineAssistants = uniqueIds(snapshot.assistantTurnIds);
+    if (!baselineAssistants.ok && snapshot.assistantTurnIds.length > 0) {
+      throw new WebError(
+        baselineAssistants.reason === "duplicate" ? "WEB_TURN_AMBIGUOUS" : "WEB_TURN_STATE_UNKNOWN",
+        "ChatGPT assistant turns were not unique; refusing to continue"
+      );
+    }
+    const baselineUsers = uniqueIds(snapshot.userTurnIds);
+    if (!baselineUsers.ok && snapshot.userTurnIds.length > 0) {
+      throw new WebError(
+        baselineUsers.reason === "duplicate" ? "WEB_TURN_AMBIGUOUS" : "WEB_TURN_STATE_UNKNOWN",
+        "ChatGPT user turns were not unique; refusing to continue"
+      );
+    }
+  }
+
+  private failWatchedTurn(
+    watched: Extract<ReturnType<typeof watchSentTurn>, { status: "fail" }>,
+    opts: SendWaitOptions,
+    origin: "send" | "manual"
+  ): never {
+    if (watched.reason === "multiple_user_turns" && (opts.multipleUserTurns === "concurrent" || origin === "manual")) {
+      throw new WebError(
+        "WEB_CHAT_CONCURRENT_USER_TURN",
+        "A new human user turn arrived while another exchange was still active"
+      );
+    }
+    throw new WebError(
+      watched.code,
+      watched.code === "WEB_TURN_STATE_UNKNOWN"
+        ? "ChatGPT UI changed after send; refusing to resend"
+        : watched.code === "WEB_TURN_AMBIGUOUS"
+          ? "ChatGPT turn identity was ambiguous after send"
+          : watched.code === "WEB_CHALLENGE"
+            ? "ChatGPT presented a CAPTCHA or challenge"
+            : "ChatGPT reported a rate or usage limit"
+    );
+  }
+
+  private async waitForBoundExchange(
+    baseline: SendBaseline,
+    opts: SendWaitOptions,
+    origin: "send" | "manual"
+  ): Promise<string> {
+    const timeoutMs = opts.timeoutMs && opts.timeoutMs > 0 ? opts.timeoutMs : origin === "manual" ? Number.POSITIVE_INFINITY : 10 * 60_000;
+    const deadline = Number.isFinite(timeoutMs) ? Date.now() + timeoutMs : Number.POSITIVE_INFINITY;
     let lastText = "";
     let stableSince = 0;
     while (Date.now() < deadline) {
-      if (opts.signal?.aborted) throw new WebError("WEB_TIMEOUT", "Research was cancelled");
+      if (opts.signal?.aborted) throw new WebError("WEB_TIMEOUT", "Web session was cancelled");
       this.throwIfDrifted();
       const snapshot = await this.snapshot();
       const watched = watchSentTurn(baseline, snapshot);
-      if (watched.status === "fail") {
-        throw new WebError(
-          watched.code,
-          watched.code === "WEB_TURN_STATE_UNKNOWN"
-            ? "ChatGPT UI changed after send; refusing to resend"
-            : watched.code === "WEB_TURN_AMBIGUOUS"
-              ? "ChatGPT turn identity was ambiguous after send"
-              : watched.code === "WEB_CHALLENGE"
-                ? "ChatGPT presented a CAPTCHA or challenge"
-                : "ChatGPT reported a rate or usage limit"
-        );
-      }
+      if (watched.status === "fail") this.failWatchedTurn(watched, opts, origin);
       if (watched.status === "complete") {
         if (watched.text === lastText && watched.text.trim()) {
           if (stableSince === 0) stableSince = Date.now();
           if (Date.now() - stableSince >= 1500) {
-            this.sendGuard.markAcknowledged();
+            this.seen = mergeSeenTurns(baseline, snapshot);
             return watched.text;
           }
         } else {
@@ -250,7 +312,12 @@ export class PlaywrightChatSession implements ChatSession {
       }
       await waitForSignal(opts.signal, 400);
     }
-    throw new WebError("WEB_TURN_STATE_UNKNOWN", "Timed out waiting for a unique assistant turn after send");
+    throw new WebError(
+      "WEB_TURN_STATE_UNKNOWN",
+      origin === "manual"
+        ? "Timed out waiting for a unique assistant turn after a user message"
+        : "Timed out waiting for a unique assistant turn after send"
+    );
   }
 
   async close(): Promise<void> {

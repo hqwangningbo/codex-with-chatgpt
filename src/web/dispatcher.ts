@@ -2,12 +2,12 @@ import { z } from "zod";
 import { Workspace, WorkspaceError } from "../workspace/manager.js";
 import { searchWorkspace } from "../workspace/search.js";
 import { gitDiff, gitInfo, gitStatus, type DiffMode } from "../workspace/git.js";
-import { activeWriteScope, writeScopeInfo, type WriteScopeState } from "../write-scope/state.js";
+import { activeWriteScope, readWriteScopeState, writeScopeInfo, type WriteScopeState } from "../write-scope/state.js";
 import { writeFileWithinScope, WriteScopeError } from "../write-scope/write-file.js";
 import { PocError, runPoc } from "../poc/run.js";
 import { findBridgeObservation } from "../bridge/runtime.js";
 import { sanitizeExecutionOutput } from "../execution/sanitize.js";
-import { MUTABLE_TOOLS, type ToolCallAction, type WebToolName } from "./protocol.js";
+import { MUTABLE_TOOLS, type WebToolInvocation, type WebToolName } from "./protocol.js";
 import { WebError } from "./errors.js";
 
 export interface CapabilitySnapshot {
@@ -96,7 +96,7 @@ export async function assertMutableCapability(
     throw new WebError("BRIDGE_NOT_RUNNING", "Workspace Bridge is not running");
   }
   if (observation.runtime.startedAt !== snapshot.bridgeStartedAt) {
-    throw new WebError("WEB_CAPABILITY_REVOKED", "Bridge session changed during this research task");
+    throw new WebError("WEB_CAPABILITY_REVOKED", "Bridge session changed during this web session");
   }
   const scope = activeWriteScope(workspace.id, snapshot.bridgeStartedAt);
   if (!scope || scope.root !== snapshot.root || scope.mode !== snapshot.mode) {
@@ -146,10 +146,21 @@ function boundResult(workspace: Workspace, value: unknown): unknown {
   }
 }
 
+export async function assertBridgeForStoredScope(workspace: Workspace): Promise<void> {
+  const stored = readWriteScopeState(workspace.id);
+  if (!stored) return;
+  const expires = Date.parse(stored.expiresAt);
+  if (!Number.isFinite(expires) || expires <= Date.now()) return;
+  const observation = await findBridgeObservation(workspace.id);
+  if (observation.state !== "healthy" || observation.runtime.startedAt !== stored.bridgeStartedAt) {
+    throw new WebError("BRIDGE_NOT_RUNNING", "Writable Scope requires a live Bridge");
+  }
+}
+
 export async function dispatchWebTool(
   workspace: Workspace,
   snapshot: CapabilitySnapshot,
-  call: ToolCallAction
+  call: WebToolInvocation
 ): Promise<DispatchResult> {
   try {
     switch (call.tool) {

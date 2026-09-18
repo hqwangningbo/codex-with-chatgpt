@@ -57,6 +57,8 @@ export async function runResearchTurn(input: ResearchInput): Promise<ResearchRes
     startedAt: new Date().toISOString(),
     stepCount: 0,
     status: "running",
+    kind: "research",
+    sessionId: null,
   });
 
   const seenCallIds = new Set<string>();
@@ -101,6 +103,7 @@ export async function runResearchTurn(input: ResearchInput): Promise<ResearchRes
         startedAt: new Date().toISOString(),
         stepCount: steps,
         status: "running",
+        kind: "research",
       });
       const dispatched = await dispatchWebTool(input.workspace, snapshot, parsed.action);
       reply = await input.session.sendAndWait(
@@ -125,6 +128,7 @@ export async function runResearchTurn(input: ResearchInput): Promise<ResearchRes
       startedAt: new Date().toISOString(),
       stepCount: steps,
       status: input.signal?.aborted ? "interrupted" : "failed",
+      kind: "research",
     });
     return {
       requestId,
@@ -144,6 +148,7 @@ function finish(workspace: Workspace, requestId: string, steps: number, action: 
     startedAt: new Date().toISOString(),
     stepCount: steps,
     status: "completed",
+    kind: "research",
   });
   return {
     requestId,

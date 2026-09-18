@@ -115,6 +115,7 @@ export function turnLooksComplete(snapshot: ChatGptSnapshot, assistantId: string
 export interface SendBaseline {
   assistantTurnIds: string[];
   turnContainerIds: string[];
+  userTurnIds: string[];
 }
 
 export type SentTurnWatch =
@@ -123,14 +124,33 @@ export type SentTurnWatch =
   | {
       status: "fail";
       code: "WEB_TURN_AMBIGUOUS" | "WEB_TURN_STATE_UNKNOWN" | "WEB_CHALLENGE" | "WEB_RATE_LIMIT";
+      reason?: "multiple_user_turns";
     };
 
 export function sendBaselineFrom(snapshot: ChatGptSnapshot): SendBaseline {
   return {
     assistantTurnIds: snapshot.assistantTurnIds,
     turnContainerIds: snapshot.turnContainerIds,
+    userTurnIds: snapshot.userTurnIds,
   };
 }
+
+export function mergeSeenTurns(seen: SendBaseline, snapshot: ChatGptSnapshot): SendBaseline {
+  const merge = (previous: string[], next: string[]): string[] => [
+    ...new Set([...previous, ...next.filter((id) => id && id.trim())]),
+  ];
+  return {
+    userTurnIds: merge(seen.userTurnIds, snapshot.userTurnIds),
+    assistantTurnIds: merge(seen.assistantTurnIds, snapshot.assistantTurnIds),
+    turnContainerIds: merge(seen.turnContainerIds, snapshot.turnContainerIds),
+  };
+}
+
+export const EMPTY_SEND_BASELINE: SendBaseline = {
+  assistantTurnIds: [],
+  turnContainerIds: [],
+  userTurnIds: [],
+};
 
 /**
  * After a send click, bind the reply to a unique new logical container.
@@ -157,6 +177,20 @@ export function watchSentTurn(baseline: SendBaseline, snapshot: ChatGptSnapshot)
       code: assistants.reason === "duplicate" ? "WEB_TURN_AMBIGUOUS" : "WEB_TURN_STATE_UNKNOWN",
     };
   }
+
+  const users = uniqueIds(snapshot.userTurnIds);
+  if (!users.ok && snapshot.userTurnIds.length > 0) {
+    return {
+      status: "fail",
+      code: users.reason === "duplicate" ? "WEB_TURN_AMBIGUOUS" : "WEB_TURN_STATE_UNKNOWN",
+    };
+  }
+
+  const newUsers = users.ok ? newLogicalIds(baseline.userTurnIds, users.ids) : [];
+  if (newUsers.length > 1) {
+    return { status: "fail", code: "WEB_TURN_AMBIGUOUS", reason: "multiple_user_turns" };
+  }
+  if (newUsers.length === 0) return { status: "waiting" };
 
   const newContainers = newLogicalIds(baseline.turnContainerIds, containers.ids);
   const newAssistants = assistants.ok ? newLogicalIds(baseline.assistantTurnIds, assistants.ids) : [];

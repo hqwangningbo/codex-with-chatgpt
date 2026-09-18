@@ -148,3 +148,147 @@ export function protocolCorrection(requestId: string, reason: string): string {
     "Do not explain outside the envelope.",
   ].join("\n");
 }
+
+export const WEB_CHAT_PROTOCOL = "c2c-web-chat-v1";
+
+const chatToolCallSchema = z.object({
+  protocol: z.literal(WEB_CHAT_PROTOCOL),
+  session_id: z.string().min(8),
+  type: z.literal("tool_call"),
+  call_id: z.string().min(1),
+  tool: z.enum(WEB_TOOLS),
+  arguments: z.record(z.unknown()).default({}),
+});
+
+export type ChatToolCallAction = z.infer<typeof chatToolCallSchema>;
+export type WebToolInvocation = { tool: WebToolName; arguments: Record<string, unknown> };
+
+export function newChatSessionId(): string {
+  return `c2c_wc_${randomBytes(12).toString("hex")}`;
+}
+
+export type ParseChatActionResult =
+  | { ok: true; action: ChatToolCallAction }
+  | { ok: false; kind: "prose" }
+  | { ok: false; kind: "malformed"; code: "WEB_PROTOCOL_INVALID"; message: string };
+
+export function parseChatAssistantAction(
+  text: string,
+  sessionId: string,
+  seenCallIds: Set<string>
+): ParseChatActionResult {
+  const trimmed = text.trim();
+  if (!trimmed) return { ok: false, kind: "prose" };
+  const exact = trimmed.startsWith(ACTION_OPEN) && trimmed.endsWith(ACTION_CLOSE);
+  if (!exact) return { ok: false, kind: "prose" };
+  const inner = trimmed.slice(ACTION_OPEN.length, trimmed.length - ACTION_CLOSE.length).trim();
+  if (inner.includes(ACTION_OPEN) || inner.includes(ACTION_CLOSE)) {
+    return {
+      ok: false,
+      kind: "malformed",
+      code: "WEB_PROTOCOL_INVALID",
+      message: "Multiple <C2C_ACTION> envelopes are not allowed",
+    };
+  }
+  let raw: unknown;
+  try {
+    raw = JSON.parse(inner);
+  } catch {
+    return { ok: false, kind: "malformed", code: "WEB_PROTOCOL_INVALID", message: "C2C_ACTION JSON is malformed" };
+  }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return { ok: false, kind: "malformed", code: "WEB_PROTOCOL_INVALID", message: "C2C_ACTION must be an object" };
+  }
+  const record = raw as Record<string, unknown>;
+  if (record.protocol !== WEB_CHAT_PROTOCOL) {
+    return {
+      ok: false,
+      kind: "malformed",
+      code: "WEB_PROTOCOL_INVALID",
+      message: "protocol must be c2c-web-chat-v1",
+    };
+  }
+  if (record.session_id !== sessionId) {
+    return {
+      ok: false,
+      kind: "malformed",
+      code: "WEB_PROTOCOL_INVALID",
+      message: "session_id does not match this chat session",
+    };
+  }
+  if (record.type === "final") {
+    return {
+      ok: false,
+      kind: "malformed",
+      code: "WEB_PROTOCOL_INVALID",
+      message: "Chat protocol does not use type=final",
+    };
+  }
+  if (record.type !== "tool_call") {
+    return {
+      ok: false,
+      kind: "malformed",
+      code: "WEB_PROTOCOL_INVALID",
+      message: "type must be tool_call",
+    };
+  }
+  if (typeof record.tool === "string" && !WEB_TOOLS.includes(record.tool as WebToolName)) {
+    return {
+      ok: false,
+      kind: "malformed",
+      code: "WEB_PROTOCOL_INVALID",
+      message: `unknown or forbidden tool '${record.tool}'`,
+    };
+  }
+  const parsed = chatToolCallSchema.safeParse(record);
+  if (!parsed.success) {
+    return {
+      ok: false,
+      kind: "malformed",
+      code: "WEB_PROTOCOL_INVALID",
+      message: parsed.error.issues[0]?.message ?? "invalid tool_call envelope",
+    };
+  }
+  if (seenCallIds.has(parsed.data.call_id)) {
+    return {
+      ok: false,
+      kind: "malformed",
+      code: "WEB_PROTOCOL_INVALID",
+      message: "call_id has already been used",
+    };
+  }
+  return { ok: true, action: parsed.data };
+}
+
+export function formatChatToolResult(input: {
+  sessionId: string;
+  callId: string;
+  tool: string;
+  ok: boolean;
+  result?: unknown;
+  error?: { code: string; message: string };
+}): string {
+  return `${RESULT_OPEN}\n${JSON.stringify(
+    {
+      protocol: WEB_CHAT_PROTOCOL,
+      session_id: input.sessionId,
+      call_id: input.callId,
+      tool: input.tool,
+      ok: input.ok,
+      ...(input.ok ? { result: input.result } : { error: input.error }),
+    },
+    null,
+    2
+  )}\n${RESULT_CLOSE}`;
+}
+
+export function chatProtocolCorrection(sessionId: string, reason: string): string {
+  return [
+    "The previous assistant message was not a valid C2C Chat Action envelope.",
+    `Reason: ${reason}`,
+    "If you need a local tool, output exactly one <C2C_ACTION> JSON object and nothing else.",
+    `protocol must be ${WEB_CHAT_PROTOCOL}.`,
+    `session_id must be ${sessionId}.`,
+    "Ordinary chat replies must not include <C2C_ACTION>.",
+  ].join("\n");
+}

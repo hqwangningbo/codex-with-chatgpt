@@ -41,7 +41,7 @@ function snapshot(over: Partial<ChatGptSnapshot> = {}): ChatGptSnapshot {
 }
 
 function baseline(over: Partial<SendBaseline> = {}): SendBaseline {
-  return { assistantTurnIds: [], turnContainerIds: [], ...over };
+  return { assistantTurnIds: [], turnContainerIds: [], userTurnIds: [], ...over };
 }
 
 describe("ChatGPT page fixtures", () => {
@@ -98,11 +98,16 @@ describe("ChatGPT page fixtures", () => {
   });
 
   it("binds completion to a unique new logical container, not a remounted assistant", () => {
-    const before = baseline({ assistantTurnIds: ["old-turn"], turnContainerIds: ["c-old", "c-hidden"] });
+    const before = baseline({
+      assistantTurnIds: ["old-turn"],
+      turnContainerIds: ["c-old", "c-hidden"],
+      userTurnIds: ["u-old"],
+    });
     expect(
       watchSentTurn(
         before,
         snapshot({
+          userTurnIds: ["u-old", "u-new"],
           turnContainerIds: ["c-old", "c-hidden", "c-new"],
           assistantTurnIds: ["old-turn", "new-turn"],
           assistantIdByContainer: { "c-old": "old-turn", "c-new": "new-turn" },
@@ -115,6 +120,7 @@ describe("ChatGPT page fixtures", () => {
       watchSentTurn(
         before,
         snapshot({
+          userTurnIds: ["u-old", "u-new"],
           turnContainerIds: ["c-old", "c-hidden", "c-new"],
           assistantTurnIds: ["old-turn", "new-turn"],
           assistantIdByContainer: { "c-old": "old-turn", "c-new": "new-turn" },
@@ -173,6 +179,7 @@ describe("ChatGPT page fixtures", () => {
       watchSentTurn(
         before,
         snapshot({
+          userTurnIds: ["u-new"],
           turnContainerIds: ["c-old", "c-new-1", "c-new-2"],
           assistantTurnIds: ["old-turn", "n1", "n2"],
           assistantIdByContainer: { "c-old": "old-turn", "c-new-1": "n1", "c-new-2": "n2" },
@@ -206,6 +213,7 @@ describe("ChatGPT page fixtures", () => {
       watchSentTurn(
         before,
         snapshot({
+          userTurnIds: ["u-new"],
           turnContainerIds: ["c-old", "c-new"],
           assistantTurnIds: ["old-turn"],
           assistantIdByContainer: { "c-new": "old-turn" },
@@ -302,5 +310,16 @@ describe("browser navigation allowlist", () => {
     expect(source).toContain('context.on("page"');
     expect(source).toContain("popup");
     expect(source).toContain("assertAllowedUrl");
+  });
+
+  it("denies http navigation even for allowlisted hosts", async () => {
+    const { navigationDecision } = await import("../src/web/session.js");
+    expect(navigationDecision("http://chatgpt.com/", "login")).toBe("deny");
+    expect(navigationDecision("http://chatgpt.com/", "research")).toBe("deny");
+    expect(navigationDecision("http://auth.openai.com/authorize", "login")).toBe("deny");
+    expect(navigationDecision("http://accounts.google.com/o/oauth2", "login")).toBe("deny");
+    expect(navigationDecision("https://chatgpt.com/", "research")).toBe("allow");
+    expect(navigationDecision("https://auth.openai.com/authorize", "login")).toBe("allow");
+    expect(navigationDecision("https://accounts.google.com/o/oauth2", "login")).toBe("allow");
   });
 });
