@@ -6,6 +6,9 @@
 
 这个安全版本面向私有仓库、Solidity、DeFi 和高价值工程项目。
 
+**ChatGPT 官方 Connector + 多个本地仓库** 的推荐路径是只读 Multi Bridge
+（`c2c multi`）。单仓库 `c2c start`、可选 `c2c web` 和 `c2c dev` 仍然保留。
+
 ## 架构
 
 ```text
@@ -83,6 +86,38 @@ c2c write-scope clear -w <workspace>
 
 源码目录还需要 `--yes`；根目录 `.` 还需要 `--allow-workspace-root`。
 `c2c stop` 会清除当前 Writable Scope。
+
+## Multi-Repo 只读 Bridge
+
+当 ChatGPT 需要通过**一个**官方 Connector 读取多个本地项目时，用这条路径。
+每个 `--repo` 都是只读。这条路径没有 Web Chat、`write_file`、`run_poc`、
+write-scope。
+
+```bash
+c2c multi up tbpros \
+  --repo research=/path/to/research \
+  --repo contracts=/path/to/contracts \
+  --repo dapp=/path/to/dapp \
+  --tunnel \
+  --save
+
+c2c multi add tbpros bifrost=/path/to/bifrost
+c2c multi remove tbpros bifrost
+c2c multi repos tbpros
+c2c multi status tbpros
+c2c multi address tbpros
+c2c multi down tbpros
+```
+
+首次公网：
+
+```bash
+c2c multi tunnel setup tbpros --zone example.com
+c2c multi up tbpros --tunnel
+```
+
+add/remove 不改变 MCP URL、OAuth registration 或 Named Tunnel。Connector
+只需配置一次。
 
 ## 可选 Web Research Harness
 

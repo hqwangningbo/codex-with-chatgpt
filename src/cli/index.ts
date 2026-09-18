@@ -57,6 +57,7 @@ import {
 } from "../write-scope/state.js";
 import { registerWebCommands } from "./web.js";
 import { registerDevCommands } from "./dev.js";
+import { registerMultiCommands } from "./multi.js";
 
 const program = new Command();
 
@@ -1421,6 +1422,12 @@ registerWebCommands(program, {
 });
 
 registerDevCommands(program, {
+  say,
+  check,
+  handleCliError,
+});
+
+registerMultiCommands(program, {
   say,
   check,
   handleCliError,

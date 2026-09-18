@@ -2,8 +2,9 @@
 name: codex-with-chatgpt
 description: >
   Manual Safe Mode: ChatGPT plans and reviews through an official Connector.
-  It is read-only by default and gains limited write/POC access only after an
-  explicit local Writable Scope grant.
+  Prefer `c2c multi` for multiple local repos (strictly read-only). Single-workspace
+  `c2c start` is read-only by default and gains limited write/POC access only after
+  an explicit local Writable Scope grant.
 ---
 
 # Codex with ChatGPT — Manual Safe Mode
@@ -75,6 +76,63 @@ starts a reviewable update:
 7. Reinstall this Skill and restart C2C. Do not change Codex configuration.
 
 Never use `git pull`, `git stash`, `git reset --hard`, or `git clean -fd`.
+
+## Recommended: Multi-Repo Read-Only Bridge
+
+Natural-language triggers:
+
+- “启动 tbpros 多项目 Bridge”
+- “把这几个仓库给 ChatGPT 只读”
+- “给 tbpros 加一个仓库”
+- “移除一个仓库”
+- “关闭 tbpros Bridge”
+- “给我 tbpros Connector 地址”
+
+This is the recommended official-Connector path when the user wants several
+local projects in one ChatGPT Connector. It is strictly read-only.
+
+Do **not** call `write-scope`, `c2c web login`, `c2c web chat`, or `c2c dev`
+for this path.
+
+1. First create (save the profile):
+
+   `c2c multi up tbpros --repo research=<abs> --repo contracts=<abs> --repo dapp=<abs> --tunnel --save`
+
+2. Later start:
+
+   `c2c multi up tbpros --tunnel`
+
+3. Status / address / list:
+
+   `c2c multi status tbpros`
+   `c2c multi address tbpros`
+   `c2c multi repos tbpros`
+
+   Do not print canonical local roots unless the user asked for `--verbose`.
+   Prefer the public MCP URL when a verified Named Tunnel is active.
+
+4. Hot add / remove (MCP URL, OAuth, and Tunnel stay the same):
+
+   `c2c multi add tbpros bifrost=<abs>`
+   `c2c multi remove tbpros bifrost`
+
+5. Stop:
+
+   `c2c multi down tbpros`
+
+   This stops the Bridge and Tunnel. It must not delete the saved profile,
+   Named Tunnel, DNS, OAuth registration, or Connector configuration.
+
+6. First-time public access uses this profile's Named Tunnel identity:
+
+   `c2c multi tunnel setup tbpros --zone example.com`
+
+   After one successful setup, `c2c multi up tbpros --tunnel` reuses the same
+   hostname. Never imply Quick.
+
+Every `--repo` is read-only. Multi MCP does not register `write_file`,
+`run_poc`, or `write_scope_info`. Never infer sibling/parent repos. ChatGPT
+only sees `workspace://<alias>/...`.
 
 ## Daily Bridge lifecycle
 

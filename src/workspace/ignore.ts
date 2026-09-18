@@ -139,15 +139,22 @@ export function collectMatchingInodes(root: string, match: (relPath: string) => 
  */
 export class SensitiveInodeRegistry {
   private readonly inodes = new Set<string>();
-  private readonly sources: Array<{ root: string; match: (relPath: string) => boolean }> = [];
+  private readonly sources: Array<{ id: string; root: string; match: (relPath: string) => boolean }> = [];
 
-  attach(root: string, match: (relPath: string) => boolean, initial?: Iterable<string>): void {
-    if (!this.sources.some((source) => source.root === root)) {
-      this.sources.push({ root, match });
+  attach(root: string, match: (relPath: string) => boolean, initial?: Iterable<string>, sourceId = root): void {
+    if (!this.sources.some((source) => source.id === sourceId)) {
+      this.sources.push({ id: sourceId, root, match });
     }
     if (initial) {
       for (const inode of initial) this.inodes.add(inode);
     }
+  }
+
+  detach(sourceId: string): void {
+    const next = this.sources.filter((source) => source.id !== sourceId && source.root !== sourceId);
+    this.sources.length = 0;
+    this.sources.push(...next);
+    this.rebuild();
   }
 
   has(key: string): boolean {
@@ -169,6 +176,11 @@ export class SensitiveInodeRegistry {
       }
     }
     return this.snapshot();
+  }
+
+  rebuild(): Set<string> {
+    this.inodes.clear();
+    return this.rediscover();
   }
 }
 
@@ -217,6 +229,10 @@ export class IgnoreRules {
 
   private nameIsSensitive(relPath: string): boolean {
     return this.sensitive.ignores(relPath) || this.custom.ignores(relPath);
+  }
+
+  sensitiveNameMatch(relPath: string): boolean {
+    return this.nameIsSensitive(relPath);
   }
 
   private matchesSensitiveInode(relPath: string): boolean {

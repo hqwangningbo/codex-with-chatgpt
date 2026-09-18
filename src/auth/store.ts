@@ -23,6 +23,8 @@ export const DEFAULT_SCOPES: Scope[] = [
   "offline_access",
 ];
 
+export const MULTI_SCOPES: Scope[] = ["workspace.read", "workspace.search", "git.read", "offline_access"];
+
 export interface ClientRegistration {
   clientId: string;
   clientName?: string;
@@ -280,9 +282,9 @@ export class AuthStore {
   }
 }
 
-export function filterScopes(requested: string | undefined): string[] {
-  if (!requested || requested.trim() === "") return [...DEFAULT_SCOPES];
+export function filterScopes(requested: string | undefined, allowed: readonly string[] = SUPPORTED_SCOPES): string[] {
+  const allow = new Set(allowed);
+  if (!requested || requested.trim() === "") return DEFAULT_SCOPES.filter((scope) => allow.has(scope));
   const asked = requested.split(/[\s+]+/).filter(Boolean);
-  const granted = asked.filter((scope) => (SUPPORTED_SCOPES as readonly string[]).includes(scope));
-  return granted;
+  return asked.filter((scope) => allow.has(scope));
 }

@@ -12,6 +12,7 @@ export interface OAuthDeps {
   workspaceName: string;
   getBaseUrl: (req: Request) => string;
   logger: Logger;
+  scopesSupported?: readonly string[];
 }
 
 interface PendingAuthRequest {
@@ -39,7 +40,7 @@ function isAllowedRedirectUri(uri: string): boolean {
   return false;
 }
 
-function authorizationServerMetadata(base: string): Record<string, unknown> {
+function authorizationServerMetadata(base: string, scopes: readonly string[]): Record<string, unknown> {
   return {
     issuer: base,
     authorization_endpoint: `${base}/oauth/authorize`,
@@ -51,15 +52,15 @@ function authorizationServerMetadata(base: string): Record<string, unknown> {
     grant_types_supported: ["authorization_code", "refresh_token"],
     code_challenge_methods_supported: ["S256"],
     token_endpoint_auth_methods_supported: ["none"],
-    scopes_supported: [...SUPPORTED_SCOPES],
+    scopes_supported: [...scopes],
   };
 }
 
-function protectedResourceMetadata(base: string): Record<string, unknown> {
+function protectedResourceMetadata(base: string, scopes: readonly string[]): Record<string, unknown> {
   return {
     resource: `${base}/mcp`,
     authorization_servers: [base],
-    scopes_supported: [...SUPPORTED_SCOPES],
+    scopes_supported: [...scopes],
     bearer_methods_supported: ["header"],
     resource_name: PRODUCT_NAME,
   };
@@ -139,6 +140,7 @@ function pairingPage(opts: {
 export function createOAuthRouter(deps: OAuthDeps): Router {
   const router = Router();
   const pendingRequests = new Map<string, PendingAuthRequest>();
+  const scopesSupported = deps.scopesSupported ?? SUPPORTED_SCOPES;
 
   const prunePending = (): void => {
     const now = Date.now();
@@ -150,10 +152,10 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
   // ---- Discovery metadata -------------------------------------------------
 
   const asMetadataHandler = (req: Request, res: Response): void => {
-    res.json(authorizationServerMetadata(deps.getBaseUrl(req)));
+    res.json(authorizationServerMetadata(deps.getBaseUrl(req), scopesSupported));
   };
   const prMetadataHandler = (req: Request, res: Response): void => {
-    res.json(protectedResourceMetadata(deps.getBaseUrl(req)));
+    res.json(protectedResourceMetadata(deps.getBaseUrl(req), scopesSupported));
   };
   router.get("/.well-known/oauth-authorization-server", asMetadataHandler);
   router.get("/.well-known/oauth-authorization-server/mcp", asMetadataHandler);
@@ -223,7 +225,7 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
       fail("invalid_request", "PKCE with S256 is required");
       return;
     }
-    const scopes = filterScopes(query.scope);
+    const scopes = filterScopes(query.scope, scopesSupported);
     if (query.scope?.trim() && scopes.length === 0) {
       fail("invalid_scope", "No supported OAuth scope was requested");
       return;

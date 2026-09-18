@@ -5,6 +5,10 @@
 This security-focused fork is designed for private repositories, Solidity,
 DeFi, and other high-value engineering work.
 
+The recommended path for **ChatGPT's official Connector + multiple local
+repos** is the Multi-Repo Read-Only Bridge (`c2c multi`). Single-workspace
+`c2c start`, optional `c2c web`, and `c2c dev` remain available.
+
 ## Architecture
 
 ```text
@@ -86,6 +90,38 @@ c2c write-scope clear -w <workspace>
 
 Source directories require `--yes`; root `.` additionally requires
 `--allow-workspace-root`. `c2c stop` clears the active scope.
+
+## Multi-Repo Read-Only Bridge
+
+Recommended when ChatGPT should read several local projects through **one**
+official Connector. Every `--repo` is read-only. There is no Web Chat,
+`write_file`, `run_poc`, or write-scope on this path.
+
+```bash
+c2c multi up tbpros \
+  --repo research=/path/to/research \
+  --repo contracts=/path/to/contracts \
+  --repo dapp=/path/to/dapp \
+  --tunnel \
+  --save
+
+c2c multi add tbpros bifrost=/path/to/bifrost
+c2c multi remove tbpros bifrost
+c2c multi repos tbpros
+c2c multi status tbpros
+c2c multi address tbpros
+c2c multi down tbpros
+```
+
+First-time public access:
+
+```bash
+c2c multi tunnel setup tbpros --zone example.com
+c2c multi up tbpros --tunnel
+```
+
+Add/remove does not change the MCP URL, OAuth registration, or Named Tunnel.
+The Connector is configured once.
 
 ## Optional Web Research Harness
 

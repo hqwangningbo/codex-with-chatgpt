@@ -49,13 +49,19 @@ export function isPublicTransportError(error: unknown): boolean {
 
 function assertHealthPayload(status: number, body: string, workspaceId: string): void {
   if (status !== 200) throw new Error(`Tunnel health check returned HTTP ${status}`);
-  let payload: { service?: string; workspaceId?: string; status?: string } | null = null;
+  let payload: { service?: string; workspaceId?: string; environmentId?: string; status?: string } | null = null;
   try {
-    payload = JSON.parse(body) as { service?: string; workspaceId?: string; status?: string };
+    payload = JSON.parse(body) as {
+      service?: string;
+      workspaceId?: string;
+      environmentId?: string;
+      status?: string;
+    };
   } catch {
     payload = null;
   }
-  if (payload?.service !== SERVICE_NAME || payload.status !== "ok" || payload.workspaceId !== workspaceId) {
+  const id = payload?.environmentId ?? payload?.workspaceId;
+  if (payload?.service !== SERVICE_NAME || payload.status !== "ok" || id !== workspaceId) {
     throw new Error("Tunnel health check returned the wrong service or workspace");
   }
 }
@@ -139,14 +145,19 @@ export async function adminFetch<T = unknown>(
   runtime: RuntimeState,
   method: "GET" | "POST",
   route: string,
-  timeoutMs = 60_000
+  timeoutMs = 60_000,
+  requestBody?: unknown
 ): Promise<T> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(`http://127.0.0.1:${runtime.port}${route}`, {
       method,
-      headers: { Authorization: `Bearer ${runtime.adminToken}` },
+      headers: {
+        Authorization: `Bearer ${runtime.adminToken}`,
+        ...(requestBody !== undefined ? { "content-type": "application/json" } : {}),
+      },
+      body: requestBody !== undefined ? JSON.stringify(requestBody) : undefined,
       signal: controller.signal,
     });
     const body = (await response.json().catch(() => ({}))) as T & { message?: string };
