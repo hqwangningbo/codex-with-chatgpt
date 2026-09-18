@@ -12,6 +12,12 @@ import {
 } from "../dev/profile.js";
 import { addressDevEnvironment, accessLabel, downDevEnvironment, statusDevEnvironment, upDevEnvironment } from "../dev/lifecycle.js";
 import { assertProfileName } from "../dev/mounts.js";
+import {
+  chooseDevNamedTunnel,
+  chooseDevQuickTunnel,
+  devTunnelChoicePayload,
+} from "../dev/tunnel.js";
+import { NAMED_LOGIN_PROMPT } from "../tunnel/state.js";
 
 interface CliHelpers {
   say: (msg: string) => void;
@@ -98,9 +104,91 @@ export function registerDevCommands(program: Command, helpers: CliHelpers): void
             mode: opts.mode,
             save: opts.save,
           });
-          const result = await upDevEnvironment({ profile, tunnel: opts.tunnel });
           const mounts = resolvedMounts(profile);
-          if (opts.json && !opts.chat) {
+          const result = await upDevEnvironment({
+            profile,
+            tunnel: opts.tunnel,
+            startChat: opts.chat
+              ? async ({ env, runtime, localMcpUrl, publicMcpUrl, markChatReady }) => {
+                  const printReadyBanner = (sessionId?: string): void => {
+                    if (opts.json) {
+                      say(
+                        JSON.stringify({
+                          ok: true,
+                          environmentId: runtime.environmentId,
+                          localMcpUrl,
+                          publicMcpUrl,
+                          mounts: mounts.map((mount) => publicMountView(mount, profile.mode)),
+                          chat: { status: "ready", sessionId: sessionId ?? null },
+                        })
+                      );
+                      return;
+                    }
+                    say(`Development environment: ${profile.name}`);
+                    say("");
+                    say("Bridge local:");
+                    say(localMcpUrl);
+                    if (publicMcpUrl) {
+                      say("");
+                      say("Bridge public:");
+                      say(publicMcpUrl);
+                    }
+                    say("");
+                    say("Workspaces:");
+                    for (const mount of mounts) {
+                      say(`${mount.alias.padEnd(12)} ${accessLabel(mount.access, profile.mode)}`);
+                    }
+                    say("");
+                    say("Web Chat:");
+                    say("ready");
+                    say("请直接在打开的 ChatGPT 页面聊天。");
+                    say("");
+                    say("Stop:");
+                    say(`c2c dev down ${profile.name}`);
+                  };
+
+                  const { openChatSession } = await import("../web/session.js");
+                  const { runDevChat } = await import("../dev/chat-turn.js");
+                  const { session } = await openChatSession({});
+                  const ac = new AbortController();
+                  const onAbort = (): void => ac.abort();
+                  process.on("SIGINT", onAbort);
+                  process.on("SIGTERM", onAbort);
+                  try {
+                    let ready = false;
+                    const chat = await runDevChat({
+                      env,
+                      session,
+                      signal: ac.signal,
+                      onReady: (info) => {
+                        ready = true;
+                        markChatReady();
+                        printReadyBanner(info.sessionId);
+                      },
+                    });
+                    if (!ready) {
+                      throw new WebError(
+                        (chat.error?.code as never) ?? "WEB_SESSION_NOT_READY",
+                        chat.error?.message ?? "Dev Chat failed before ready"
+                      );
+                    }
+                    if (opts.json && chat.status === "failed") process.exitCode = 1;
+                    if (!opts.json && chat.status === "failed") {
+                      throw new WebError(
+                        (chat.error?.code as never) ?? "WEB_PROTOCOL_INVALID",
+                        chat.error?.message ?? "Dev Chat failed"
+                      );
+                    }
+                  } finally {
+                    process.off("SIGINT", onAbort);
+                    process.off("SIGTERM", onAbort);
+                    await session.close();
+                  }
+                }
+              : undefined,
+          });
+          if (opts.chat) return;
+          if (opts.json) {
             say(
               JSON.stringify({
                 ok: true,
@@ -117,73 +205,23 @@ export function registerDevCommands(program: Command, helpers: CliHelpers): void
             );
             return;
           }
-          if (!opts.json) {
-            say(`Development environment: ${profile.name}`);
+          say(`Development environment: ${profile.name}`);
+          say("");
+          say("Bridge local:");
+          say(result.localMcpUrl);
+          if (result.publicMcpUrl) {
             say("");
-            say("Bridge local:");
-            say(result.localMcpUrl);
-            if (result.publicMcpUrl) {
-              say("");
-              say("Bridge public:");
-              say(result.publicMcpUrl);
-            }
-            say("");
-            say("Workspaces:");
-            for (const mount of mounts) {
-              say(`${mount.alias.padEnd(12)} ${accessLabel(mount.access, profile.mode)}`);
-            }
-            say("");
-            say("Stop:");
-            say(`c2c dev down ${profile.name}`);
+            say("Bridge public:");
+            say(result.publicMcpUrl);
           }
-          if (!opts.chat) return;
-
-          const { loadRunningEnvironment } = await import("../dev/lifecycle.js");
-          const { openChatSession } = await import("../web/session.js");
-          const { runDevChat } = await import("../dev/chat-turn.js");
-          const env = loadRunningEnvironment(profile.name);
-          const { session } = await openChatSession({});
-          const ac = new AbortController();
-          const onAbort = (): void => ac.abort();
-          process.on("SIGINT", onAbort);
-          process.on("SIGTERM", onAbort);
-          try {
-            const chat = await runDevChat({
-              env,
-              session,
-              signal: ac.signal,
-              onReady: (info) => {
-                if (opts.json) {
-                  say(
-                    JSON.stringify({
-                      ok: true,
-                      environmentId: result.runtime.environmentId,
-                      localMcpUrl: result.localMcpUrl,
-                      publicMcpUrl: result.publicMcpUrl,
-                      mounts: mounts.map((mount) => publicMountView(mount, profile.mode)),
-                      chat: { status: "ready", sessionId: info.sessionId },
-                    })
-                  );
-                  return;
-                }
-                say("");
-                say("Web Chat:");
-                say("ready");
-                say("请直接在打开的 ChatGPT 页面聊天。");
-              },
-            });
-            if (opts.json && chat.status === "failed") process.exitCode = 1;
-            if (!opts.json && chat.status === "failed") {
-              throw new WebError(
-                (chat.error?.code as never) ?? "WEB_PROTOCOL_INVALID",
-                chat.error?.message ?? "Dev Chat failed"
-              );
-            }
-          } finally {
-            process.off("SIGINT", onAbort);
-            process.off("SIGTERM", onAbort);
-            await session.close();
+          say("");
+          say("Workspaces:");
+          for (const mount of mounts) {
+            say(`${mount.alias.padEnd(12)} ${accessLabel(mount.access, profile.mode)}`);
           }
+          say("");
+          say("Stop:");
+          say(`c2c dev down ${profile.name}`);
         } catch (error) {
           handleCliError(error, opts.json);
         }
@@ -357,4 +395,115 @@ export function registerDevCommands(program: Command, helpers: CliHelpers): void
         handleCliError(error, opts.json);
       }
     });
+
+  const tunnelCmd = dev.command("tunnel").description("Named Tunnel for a saved development profile");
+
+  const printTunnelStatus = (name: string, json: boolean, zone?: string): void => {
+    const payload = devTunnelChoicePayload(name, zone);
+    if (json) {
+      say(JSON.stringify(payload));
+      return;
+    }
+    if (payload.needsChoice) say("This development profile still needs a one-time Named Tunnel setup.");
+    else if (payload.namedReady) check(`固定域名：${payload.hostname}`);
+    else say("当前使用临时地址。");
+  };
+
+  tunnelCmd
+    .command("status", { isDefault: true })
+    .description("Show whether this development profile still needs Named Tunnel setup")
+    .argument("<name>", "saved profile name")
+    .option("--zone <domain>", "optional domain, used to preview the stable hostname")
+    .option("--json", "machine-readable output", false)
+    .action((name: string, opts: { zone?: string; json: boolean }) => {
+      try {
+        printTunnelStatus(assertProfileName(name), opts.json, opts.zone);
+      } catch (error) {
+        handleCliError(error, opts.json);
+      }
+    });
+
+  const runNamedSetup = async (
+    name: string,
+    opts: { zone?: string; hostname?: string; json: boolean }
+  ): Promise<void> => {
+    const result = await chooseDevNamedTunnel({
+      name: assertProfileName(name),
+      zone: opts.zone,
+      hostname: opts.hostname,
+    });
+    if (result.ok) {
+      if (opts.json) {
+        say(JSON.stringify(result.payload));
+        return;
+      }
+      check(`Profile：${name}`);
+      check("Mode：Named Tunnel");
+      check(`Hostname：${result.state.hostname}`);
+      check("Status：Ready");
+      return;
+    }
+    if (opts.json) {
+      say(JSON.stringify(result.payload));
+      process.exitCode = 1;
+      return;
+    }
+    if (result.need === "zone") {
+      say(result.userMessage);
+      return;
+    }
+    throw new Error(result.userMessage);
+  };
+
+  tunnelCmd
+    .command("setup")
+    .description("First-time Named Tunnel setup for this development profile")
+    .argument("<name>", "saved profile name")
+    .option("--zone <domain>", "Cloudflare domain for a named hostname")
+    .option("--hostname <hostname>", "override the default c2c-<profile>.<zone>")
+    .option("--json", "machine-readable output", false)
+    .action(async (name: string, opts: { zone?: string; hostname?: string; json: boolean }) => {
+      try {
+        if (!opts.json) say(NAMED_LOGIN_PROMPT);
+        await runNamedSetup(name, opts);
+      } catch (error) {
+        handleCliError(error, opts.json);
+      }
+    });
+
+  tunnelCmd
+    .command("choose")
+    .description("Remember named (or explicit quick) for this development profile")
+    .argument("<name>", "saved profile name")
+    .option("--named", "provision or reuse the profile Named Tunnel", false)
+    .option("--quick", "explicitly choose a temporary address; never implied", false)
+    .option("--zone <domain>", "Cloudflare domain for a named hostname")
+    .option("--hostname <hostname>", "override the default c2c-<profile>.<zone>")
+    .option("--json", "machine-readable output", false)
+    .action(
+      async (
+        name: string,
+        opts: { named: boolean; quick: boolean; zone?: string; hostname?: string; json: boolean }
+      ) => {
+        try {
+          if (opts.named && opts.quick) {
+            throw new DevError("DEV_PROTOCOL_INVALID", "Pass either --named or --quick, not both");
+          }
+          if (!opts.named && !opts.quick) {
+            throw new DevError("DEV_PROTOCOL_INVALID", "Pass --named (recommended) or --quick");
+          }
+          if (opts.quick) {
+            const state = chooseDevQuickTunnel(assertProfileName(name));
+            const payload = { ...devTunnelChoicePayload(name), state, implicitQuick: false };
+            if (opts.json) say(JSON.stringify(payload));
+            else check("已选用临时地址");
+            return;
+          }
+          if (!opts.json) say(NAMED_LOGIN_PROMPT);
+          await runNamedSetup(name, opts);
+        } catch (error) {
+          handleCliError(error, opts.json);
+        }
+      }
+    );
 }

@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import readline from "node:readline";
-import { IgnoreRules } from "./ignore.js";
+import { IgnoreRules, type SensitiveInodeRegistry } from "./ignore.js";
 import { sanitizeWorkspaceText } from "./sanitize.js";
 import { readJsonIfExists } from "../config/paths.js";
 
@@ -90,7 +90,7 @@ export class Workspace {
   readonly projectConfig: ProjectConfig;
   private readonly writeTokenKey: Buffer;
 
-  constructor(rootInput: string) {
+  constructor(rootInput: string, opts?: { sensitiveInodeRegistry?: SensitiveInodeRegistry }) {
     const resolved = path.resolve(rootInput);
     let real: string;
     try {
@@ -103,7 +103,7 @@ export class Workspace {
     }
     this.root = real;
     this.id = createHash("sha256").update(normCase(real)).digest("hex").slice(0, 12);
-    this.ignoreRules = new IgnoreRules(real);
+    this.ignoreRules = new IgnoreRules(real, opts?.sensitiveInodeRegistry);
     this.projectConfig = parseProjectConfig(readJsonIfExists<unknown>(path.join(real, ".c2c.json")));
     this.name = this.projectConfig.name ?? path.basename(real);
     this.writeTokenKey = randomBytes(32);

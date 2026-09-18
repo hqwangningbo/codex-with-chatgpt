@@ -11,7 +11,12 @@ import type { RuntimeState } from "../bridge/runtime.js";
 import { observeWebTask, stopWebTask } from "../web/state.js";
 import { WebError } from "../web/errors.js";
 import { DevError } from "./errors.js";
-import { captureDevCapability, createDevEnvironment, environmentFromCapability } from "./environment.js";
+import {
+  captureDevCapability,
+  createDevEnvironment,
+  environmentFromCapability,
+  type DevEnvironment,
+} from "./environment.js";
 import {
   capabilityFromRuntime,
   clearDevRuntime,
@@ -22,6 +27,13 @@ import {
 } from "./runtime.js";
 import { tunnelIdentityFor, type DevProfile } from "./profile.js";
 import type { MountAccess } from "./mounts.js";
+
+export const DEV_STOP_WAIT_MS = 10_000;
+
+export interface DevUpSpawned {
+  bridge: boolean;
+  tunnel: boolean;
+}
 
 function cliEntry(): { cmd: string; args: string[] } {
   const distEntry = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "cli", "index.js");
@@ -141,36 +153,99 @@ export async function attachTunnel(runtime: DevRuntimeState): Promise<{
   return { runtime: latest, publicVerification: started.transport };
 }
 
+export async function stopDevTunnel(name: string): Promise<void> {
+  const observation = await findDevObservation(name);
+  if (observation.state !== "healthy") return;
+  await adminFetch(asBridgeRuntime(observation.runtime), "POST", "/admin/tunnel/stop", 5000);
+  const latest = readDevRuntime(name);
+  if (latest) writeDevRuntime({ ...latest, publicUrl: null });
+}
+
+export async function rollbackThisUp(name: string, spawned: DevUpSpawned): Promise<void> {
+  if (spawned.bridge) {
+    await downDevEnvironment(name, { ignoreChat: true });
+    return;
+  }
+  if (spawned.tunnel) {
+    await stopDevTunnel(name);
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitUntilDevStopped(name: string, deadline: number): Promise<boolean> {
+  while (Date.now() < deadline) {
+    const current = await findDevObservation(name);
+    if (current.state === "stopped") return true;
+    await sleep(100);
+  }
+  return false;
+}
+
 export async function upDevEnvironment(input: {
   profile: DevProfile;
   tunnel?: boolean;
+  startChat?: (ctx: {
+    env: DevEnvironment;
+    runtime: DevRuntimeState;
+    localMcpUrl: string;
+    publicMcpUrl: string | null;
+    publicVerification: "direct" | "system-proxy" | null;
+    markChatReady: () => void;
+  }) => Promise<void>;
+  ensureRunning?: (profile: DevProfile) => Promise<{ runtime: DevRuntimeState; spawned: boolean }>;
+  attachTunnel?: (runtime: DevRuntimeState) => Promise<{
+    runtime: DevRuntimeState;
+    publicVerification: "direct" | "system-proxy";
+  }>;
 }): Promise<{
   runtime: DevRuntimeState;
   spawned: boolean;
+  started: DevUpSpawned;
   localMcpUrl: string;
   publicMcpUrl: string | null;
   publicVerification: "direct" | "system-proxy" | null;
 }> {
-  let spawned = false;
+  const started: DevUpSpawned = { bridge: false, tunnel: false };
+  let chatReady = false;
   try {
-    const ensured = await ensureEnvironmentRunning(input.profile);
-    spawned = ensured.spawned;
+    const ensureRunning = input.ensureRunning ?? ensureEnvironmentRunning;
+    const attach = input.attachTunnel ?? attachTunnel;
+    const ensured = await ensureRunning(input.profile);
+    started.bridge = ensured.spawned;
     let runtime = ensured.runtime;
     let publicVerification: "direct" | "system-proxy" | null = null;
-    if (input.tunnel) {
-      const attached = await attachTunnel(runtime);
+    const hadPublicUrl = Boolean(runtime.publicUrl);
+    if (input.tunnel && !hadPublicUrl) {
+      const attached = await attach(runtime);
       runtime = attached.runtime;
       publicVerification = attached.publicVerification;
+      started.tunnel = true;
     }
     const localMcpUrl = `http://127.0.0.1:${runtime.port}/mcp`;
     const publicMcpUrl = runtime.publicUrl ? `${runtime.publicUrl.replace(/\/+$/, "")}/mcp` : null;
-    return { runtime, spawned, localMcpUrl, publicMcpUrl, publicVerification };
+    if (input.startChat) {
+      const env = loadRunningEnvironment(input.profile.name);
+      await input.startChat({
+        env,
+        runtime,
+        localMcpUrl,
+        publicMcpUrl,
+        publicVerification,
+        markChatReady: () => {
+          chatReady = true;
+        },
+      });
+    }
+    return { runtime, spawned: started.bridge, started, localMcpUrl, publicMcpUrl, publicVerification };
   } catch (error) {
-    if (spawned) {
+    if (!chatReady && (started.bridge || started.tunnel)) {
       try {
-        await downDevEnvironment(input.profile.name, { ignoreChat: true });
+        await rollbackThisUp(input.profile.name, started);
       } catch {
-        clearDevRuntime(input.profile.name);
+        // Preserve the original failure. down already refuses to clear an unproven runtime.
       }
     }
     throw error;
@@ -179,8 +254,9 @@ export async function upDevEnvironment(input: {
 
 export async function downDevEnvironment(
   name: string,
-  opts: { ignoreChat?: boolean } = {}
+  opts: { ignoreChat?: boolean; waitMs?: number } = {}
 ): Promise<{ stopped: boolean; profilePreserved: true }> {
+  const waitMs = opts.waitMs && opts.waitMs > 0 ? opts.waitMs : DEV_STOP_WAIT_MS;
   const runtime = readDevRuntime(name);
   if (!opts.ignoreChat) {
     const web = observeWebTask();
@@ -218,21 +294,25 @@ export async function downDevEnvironment(
     await adminFetch(asBridgeRuntime(live), "POST", "/admin/revoke-all", 5000).catch(() => undefined);
     await adminFetch(asBridgeRuntime(live), "POST", "/admin/shutdown", 5000);
   } catch {
-    try {
-      process.kill(live.pid, "SIGTERM");
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
-    }
+    // Authenticated shutdown may be unavailable; SIGTERM the proven PID below.
   }
 
-  const deadline = Date.now() + 5000;
-  while (Date.now() < deadline) {
-    const current = await findDevObservation(name);
-    if (current.state === "stopped") break;
-    await new Promise((resolve) => setTimeout(resolve, 100));
+  try {
+    process.kill(live.pid, "SIGTERM");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
   }
-  clearDevRuntime(name);
-  return { stopped: true, profilePreserved: true };
+
+  const deadline = Date.now() + waitMs;
+  if (await waitUntilDevStopped(name, deadline)) {
+    clearDevRuntime(name);
+    return { stopped: true, profilePreserved: true };
+  }
+
+  throw new DevError(
+    "DEV_STOP_TIMEOUT",
+    `Environment Bridge pid ${live.pid} did not exit after shutdown/SIGTERM; runtime kept`
+  );
 }
 
 export async function statusDevEnvironment(

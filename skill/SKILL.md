@@ -378,9 +378,17 @@ Behavior:
    run `c2c write-scope set` for this path. Profile edits do not enlarge a
    running session; the user must `dev down` then `dev up`.
 
-8. If `--tunnel` returns `TUNNEL_CHOICE_REQUIRED`, ask the user to choose
-   Named or Quick the same way as Daily Bridge. Never choose Quick for them.
-   Reuse the profile's Named Tunnel; do not create a new random URL.
+8. First-time public access uses this profile's Named Tunnel identity, not
+   the Daily Bridge workspace tunnel:
+
+   `c2c dev tunnel status tbpros`
+   `c2c dev tunnel setup tbpros --zone example.com`
+   `c2c dev tunnel choose tbpros --named --zone example.com`
+
+   After one successful setup, `c2c dev up tbpros --tunnel --chat` reuses the
+   same hostname. Never imply Quick. If `--tunnel` returns
+   `TUNNEL_CHOICE_REQUIRED`, run the commands above; never `c2c tunnel choose
+   -w <repo>`.
 
 9. If `c2c web status --json` shows `profileExists: false` and the user
    asked for `--chat`, tell them to run `c2c web login` themselves first.

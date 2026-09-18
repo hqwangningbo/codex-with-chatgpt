@@ -131,14 +131,56 @@ export function collectMatchingInodes(root: string, match: (relPath: string) => 
   return inodes;
 }
 
+/**
+ * Shared inode set for a Multi-Workspace Environment. When any accessed
+ * candidate has nlink > 1, every attached mount is re-scanned for
+ * `.env` / sensitive-file inodes so a hardlink alias on another mount
+ * cannot leak a file created after `dev up`.
+ */
+export class SensitiveInodeRegistry {
+  private readonly inodes = new Set<string>();
+  private readonly sources: Array<{ root: string; match: (relPath: string) => boolean }> = [];
+
+  attach(root: string, match: (relPath: string) => boolean, initial?: Iterable<string>): void {
+    if (!this.sources.some((source) => source.root === root)) {
+      this.sources.push({ root, match });
+    }
+    if (initial) {
+      for (const inode of initial) this.inodes.add(inode);
+    }
+  }
+
+  has(key: string): boolean {
+    return this.inodes.has(key);
+  }
+
+  add(key: string): void {
+    this.inodes.add(key);
+  }
+
+  snapshot(): Set<string> {
+    return new Set(this.inodes);
+  }
+
+  rediscover(): Set<string> {
+    for (const source of this.sources) {
+      for (const inode of collectMatchingInodes(source.root, source.match)) {
+        this.inodes.add(inode);
+      }
+    }
+    return this.snapshot();
+  }
+}
+
 export class IgnoreRules {
   private readonly root: string;
   private sensitive: Ignore;
   private noise: Ignore;
   private custom: Ignore;
   private sensitiveInodes: Set<string>;
+  private registry: SensitiveInodeRegistry | null;
 
-  constructor(workspaceRoot: string) {
+  constructor(workspaceRoot: string, registry?: SensitiveInodeRegistry) {
     this.root = workspaceRoot;
     this.sensitive = ignore().add(SENSITIVE_PATTERNS);
     this.noise = ignore().add(NOISE_PATTERNS);
@@ -152,14 +194,25 @@ export class IgnoreRules {
       // unreadable .c2cignore: fall back to defaults only
     }
     this.sensitiveInodes = collectMatchingInodes(workspaceRoot, (rel) => this.nameIsSensitive(rel));
+    this.registry = registry ?? null;
+    this.registry?.attach(workspaceRoot, (rel) => this.nameIsSensitive(rel), this.sensitiveInodes);
   }
 
   exportSensitiveInodes(): Set<string> {
-    return new Set(this.sensitiveInodes);
+    const out = new Set(this.sensitiveInodes);
+    if (this.registry) {
+      for (const inode of this.registry.snapshot()) out.add(inode);
+    }
+    return out;
   }
 
   mergeSensitiveInodes(inodes: Iterable<string>): void {
-    for (const inode of inodes) this.sensitiveInodes.add(inode);
+    for (const inode of inodes) this.rememberInode(inode);
+  }
+
+  private rememberInode(key: string): void {
+    this.sensitiveInodes.add(key);
+    this.registry?.add(key);
   }
 
   private nameIsSensitive(relPath: string): boolean {
@@ -170,7 +223,7 @@ export class IgnoreRules {
     const abs = path.join(this.root, relPath);
     const key = fileInodeKey(abs);
     if (!key) return false;
-    if (this.sensitiveInodes.has(key)) return true;
+    if (this.sensitiveInodes.has(key) || this.registry?.has(key)) return true;
     let nlink = 1;
     try {
       nlink = fs.lstatSync(abs).nlink;
@@ -178,6 +231,14 @@ export class IgnoreRules {
       return false;
     }
     if (nlink <= 1) return false;
+    if (this.registry) {
+      this.registry.rediscover();
+      if (this.registry.has(key)) {
+        this.rememberInode(key);
+        return true;
+      }
+      return false;
+    }
     for (const inode of collectMatchingInodes(this.root, (rel) => this.nameIsSensitive(rel))) {
       this.sensitiveInodes.add(inode);
     }
@@ -187,7 +248,12 @@ export class IgnoreRules {
   /** True when the path must be denied with ACCESS_DENIED_SENSITIVE_FILE. */
   isSensitive(relPath: string): boolean {
     if (!relPath || relPath === ".") return false;
-    return this.nameIsSensitive(relPath) || this.matchesSensitiveInode(relPath);
+    if (this.nameIsSensitive(relPath)) {
+      const key = fileInodeKey(path.join(this.root, relPath));
+      if (key) this.rememberInode(key);
+      return true;
+    }
+    return this.matchesSensitiveInode(relPath);
   }
 
   /** True when the path should be hidden from listing/search (not an error). */

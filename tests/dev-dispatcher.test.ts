@@ -215,6 +215,155 @@ describe("dev dispatcher cross-repo", () => {
     }
   });
 
+  async function assertCrossMountSecretDenied(
+    env: ReturnType<typeof createDevEnvironment>,
+    snapshot: ReturnType<typeof captureDevCapability>,
+    needle: string
+  ) {
+    const envRead = await dispatchDevTool(env, snapshot, {
+      tool: "read_file",
+      workspace: "research",
+      arguments: { path: ".env" },
+    });
+    expect(envRead.ok).toBe(false);
+    expect(JSON.stringify(envRead)).not.toContain(needle);
+
+    const aliasRead = await dispatchDevTool(env, snapshot, {
+      tool: "read_file",
+      workspace: "contracts",
+      arguments: { path: "notes.txt" },
+    });
+    expect(aliasRead.ok).toBe(false);
+    expect(aliasRead.error?.code).toBe("ACCESS_DENIED_SENSITIVE_FILE");
+    expect(JSON.stringify(aliasRead)).not.toContain(needle);
+
+    const aliasWrite = await dispatchDevTool(env, snapshot, {
+      tool: "write_file",
+      workspace: "contracts",
+      arguments: { path: "notes.txt", content: "pwn\n" },
+    });
+    expect(aliasWrite.ok).toBe(false);
+    expect(JSON.stringify(aliasWrite)).not.toContain(needle);
+
+    const search = await dispatchDevTool(env, snapshot, {
+      tool: "search_workspace",
+      workspace: "contracts",
+      arguments: { query: needle.slice(0, 8) },
+    });
+    expect(JSON.stringify(search.result ?? search.error)).not.toContain(needle);
+
+    const diff = await dispatchDevTool(env, snapshot, {
+      tool: "git_diff",
+      workspace: "contracts",
+      arguments: {},
+    });
+    expect(JSON.stringify(diff.result ?? {})).not.toContain(needle);
+  }
+
+  it("rediscovers a .env created after env start and denies the other mount's hardlink", async () => {
+    states.push(isolateStateDir());
+    const research = repo("research-late", { "docs/a.md": "ok\n" });
+    const contracts = repo("contracts-late", { "src/A.sol": "contract A {}\n" });
+    const profile = buildProfileFromFlags({
+      name: "lateenv",
+      mounts: [`research=${research}`, `contracts=${contracts}`],
+      mode: "poc",
+    });
+    const env = createDevEnvironment(profile, new Date().toISOString());
+    persist(env);
+    const snapshot = captureDevCapability(env);
+    const visible = await dispatchDevTool(env, snapshot, {
+      tool: "read_file",
+      workspace: "research",
+      arguments: { path: "docs/a.md" },
+    });
+    expect(visible.ok).toBe(true);
+
+    write(research, ".env", "PRIVATE_KEY=after-up\n");
+    try {
+      fs.linkSync(path.join(research, ".env"), path.join(contracts, "notes.txt"));
+    } catch {
+      return;
+    }
+    await assertCrossMountSecretDenied(env, snapshot, "PRIVATE_KEY=after-up");
+
+    write(contracts, "dump.mjs", "import fs from 'node:fs';\ntry { process.stdout.write(fs.readFileSync('notes.txt','utf8')) } catch { process.stdout.write('DENIED') }\n");
+    const poc = await dispatchDevTool(env, snapshot, {
+      tool: "run_poc",
+      workspace: "contracts",
+      arguments: { program: "node", args: ["dump.mjs"] },
+    });
+    expect(JSON.stringify(poc.result ?? poc.error)).not.toContain("PRIVATE_KEY=after-up");
+  });
+
+  it("rediscovers a replaced .env inode across mounts", async () => {
+    states.push(isolateStateDir());
+    const research = repo("research-replace", { "docs/a.md": "ok\n" });
+    const contracts = repo("contracts-replace", { "src/A.sol": "contract A {}\n" });
+    write(research, ".env", "PRIVATE_KEY=old-inode\n");
+    const profile = buildProfileFromFlags({
+      name: "replaceenv",
+      mounts: [`research=${research}`, `contracts=${contracts}`],
+      mode: "poc",
+    });
+    const env = createDevEnvironment(profile, new Date().toISOString());
+    persist(env);
+    const snapshot = captureDevCapability(env);
+    fs.rmSync(path.join(research, ".env"));
+    write(research, ".env", "PRIVATE_KEY=new-inode\n");
+    try {
+      fs.linkSync(path.join(research, ".env"), path.join(contracts, "notes.txt"));
+    } catch {
+      return;
+    }
+    await assertCrossMountSecretDenied(env, snapshot, "PRIVATE_KEY=new-inode");
+    expect(JSON.stringify(await dispatchDevTool(env, snapshot, {
+      tool: "read_file",
+      workspace: "contracts",
+      arguments: { path: "notes.txt" },
+    }))).not.toContain("PRIVATE_KEY=old-inode");
+  });
+
+  it("does not leak parent process.env through Dev run_poc", async () => {
+    states.push(isolateStateDir());
+    const previous = process.env.C2C_SECRET_ENV_TEST;
+    process.env.C2C_SECRET_ENV_TEST = "do-not-leak";
+    try {
+      const contracts = repo("contracts-env", { "src/A.sol": "contract A {}\n" });
+      const research = repo("research-env", { "docs/a.md": "ok\n" });
+      const profile = buildProfileFromFlags({
+        name: "envstrip",
+        mounts: [`research=${research}`, `contracts=${contracts}`],
+        mode: "poc",
+      });
+      const env = createDevEnvironment(profile, new Date().toISOString());
+      persist(env);
+      const snapshot = captureDevCapability(env);
+      write(contracts, "dump-env.mjs", "console.log(JSON.stringify(process.env))\n");
+      const nodePoc = await dispatchDevTool(env, snapshot, {
+        tool: "run_poc",
+        workspace: "contracts",
+        arguments: { program: "node", args: ["dump-env.mjs"] },
+      });
+      const nodeText = JSON.stringify(nodePoc.result ?? nodePoc.error);
+      expect(nodeText).not.toContain("C2C_SECRET_ENV_TEST");
+      expect(nodeText).not.toContain("do-not-leak");
+      if (process.platform === "darwin") expect(nodePoc.ok).toBe(true);
+      write(contracts, "dump-env.py", "import json,os\nprint(json.dumps(dict(os.environ)))\n");
+      const pyPoc = await dispatchDevTool(env, snapshot, {
+        tool: "run_poc",
+        workspace: "contracts",
+        arguments: { program: "python3", args: ["dump-env.py"] },
+      });
+      const pyText = JSON.stringify(pyPoc.result ?? pyPoc.error);
+      expect(pyText).not.toContain("C2C_SECRET_ENV_TEST");
+      expect(pyText).not.toContain("do-not-leak");
+    } finally {
+      if (previous === undefined) delete process.env.C2C_SECRET_ENV_TEST;
+      else process.env.C2C_SECRET_ENV_TEST = previous;
+    }
+  });
+
   it("does not pick up a profile mount added after the session started", async () => {
     states.push(isolateStateDir());
     const research = repo("research", { "a.md": "a\n" });

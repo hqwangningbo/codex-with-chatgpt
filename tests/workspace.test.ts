@@ -138,6 +138,27 @@ describe("sensitive files", () => {
     });
   });
 
+  it("rediscovers a .env created after Workspace construction via nlink", async () => {
+    const lateRoot = makeTmpDir("ws-late-env");
+    try {
+      write(lateRoot, "visible.txt", "ok\n");
+      const late = new Workspace(lateRoot);
+      expect((await late.readFile("visible.txt")).content).toContain("ok");
+      write(lateRoot, ".env", "SECRET=after-construct\n");
+      const alias = path.join(lateRoot, "later.txt");
+      try {
+        fs.linkSync(path.join(lateRoot, ".env"), alias);
+      } catch {
+        return;
+      }
+      await expect(late.readFile("later.txt")).rejects.toMatchObject({
+        code: "ACCESS_DENIED_SENSITIVE_FILE",
+      });
+    } finally {
+      cleanup(lateRoot);
+    }
+  });
+
   it("allows .env.example", () => {
     expect(ws.resolve(".env.example").rel).toBe(".env.example");
   });
