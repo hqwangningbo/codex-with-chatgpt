@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { readJsonIfExists, writeSecureJson } from "../config/paths.js";
 import { webRuntimeDir } from "./profile.js";
@@ -16,7 +17,7 @@ export interface WebRuntimeState {
   workspaceId: string | null;
   startedAt: string | null;
   processStartedAt: string | null;
-  command: string | null;
+  commandHash: string | null;
   stepCount: number;
   status: WebTaskStatus;
 }
@@ -40,7 +41,7 @@ const EMPTY: WebRuntimeState = {
   workspaceId: null,
   startedAt: null,
   processStartedAt: null,
-  command: null,
+  commandHash: null,
   stepCount: 0,
   status: "idle",
 };
@@ -50,15 +51,16 @@ export function webRuntimeFile(): string {
 }
 
 export function readWebRuntime(): WebRuntimeState {
-  const raw = readJsonIfExists<Partial<WebRuntimeState>>(webRuntimeFile());
+  const raw = readJsonIfExists<Partial<WebRuntimeState> & { command?: unknown }>(webRuntimeFile());
   if (!raw) return { ...EMPTY };
+  const { command: _ignored, ...safe } = raw;
   return {
     ...EMPTY,
-    ...raw,
-    processStartedAt: raw.processStartedAt ?? null,
-    command: raw.command ?? null,
-    sessionId: raw.sessionId ?? null,
-    kind: raw.kind === "chat" || raw.kind === "research" ? raw.kind : null,
+    ...safe,
+    processStartedAt: safe.processStartedAt ?? null,
+    commandHash: safe.commandHash ?? null,
+    sessionId: safe.sessionId ?? null,
+    kind: safe.kind === "chat" || safe.kind === "research" ? safe.kind : null,
   };
 }
 
@@ -126,6 +128,10 @@ function normalizePsField(value: string | null | undefined): string | null {
   return trimmed.length > 0 ? trimmed : null;
 }
 
+export function hashOwnerCommand(command: string): string {
+  return createHash("sha256").update(command).digest("hex");
+}
+
 export function isWebResearchCommand(command: string | null): boolean {
   return isHarnessSubcommand(command, "research");
 }
@@ -142,12 +148,20 @@ function isHarnessSubcommand(command: string | null, subcommand: "research" | "c
   return new RegExp(`\\bweb\\s+${subcommand}\\b`).test(text);
 }
 
+function kindFromCommand(command: string | null): WebHarnessKind | null {
+  if (isHarnessSubcommand(command, "chat")) return "chat";
+  if (isHarnessSubcommand(command, "research")) return "research";
+  return null;
+}
+
 export function isProvenWebOwner(state: WebRuntimeState, live: ProcessIdentity): boolean {
   if (state.status !== "running" || !state.pid) return false;
   if (!live.alive) return false;
   if (!state.processStartedAt || !live.startedAt) return false;
   if (state.processStartedAt !== live.startedAt) return false;
-  if (!isWebHarnessCommand(state.command) || !isWebHarnessCommand(live.command)) return false;
+  if (!isWebHarnessCommand(live.command)) return false;
+  if (!state.commandHash || !live.command || hashOwnerCommand(live.command) !== state.commandHash) return false;
+  if (state.kind && kindFromCommand(live.command) !== state.kind) return false;
   return true;
 }
 
@@ -156,22 +170,24 @@ function attachOwnerIdentity(state: WebRuntimeState): WebRuntimeState {
     return {
       ...state,
       processStartedAt: state.processStartedAt ?? null,
-      command: state.command ?? null,
+      commandHash: state.commandHash ?? null,
     };
   }
   const previous = readJsonIfExists<Partial<WebRuntimeState>>(webRuntimeFile());
-  if (previous?.pid === process.pid && previous.processStartedAt && previous.command) {
+  if (previous?.pid === process.pid && previous.processStartedAt && previous.commandHash) {
     return {
       ...state,
       processStartedAt: previous.processStartedAt,
-      command: previous.command,
+      commandHash: previous.commandHash,
+      kind: state.kind ?? previous.kind ?? null,
     };
   }
   const live = inspectProcess(process.pid);
   return {
     ...state,
     processStartedAt: live.startedAt,
-    command: process.argv.join(" "),
+    commandHash: live.command ? hashOwnerCommand(live.command) : null,
+    kind: state.kind ?? kindFromCommand(live.command),
   };
 }
 
@@ -191,8 +207,8 @@ export function activeWebTask(): WebRuntimeState | null {
 }
 
 export function writeWebRuntime(
-  state: Omit<WebRuntimeState, "processStartedAt" | "command" | "kind" | "sessionId"> &
-    Partial<Pick<WebRuntimeState, "processStartedAt" | "command" | "kind" | "sessionId">>
+  state: Omit<WebRuntimeState, "processStartedAt" | "commandHash" | "kind" | "sessionId"> &
+    Partial<Pick<WebRuntimeState, "processStartedAt" | "commandHash" | "kind" | "sessionId">>
 ): void {
   fs.mkdirSync(webRuntimeDir(), { recursive: true, mode: 0o700 });
   writeSecureJson(
@@ -201,7 +217,7 @@ export function writeWebRuntime(
       ...EMPTY,
       ...state,
       processStartedAt: state.processStartedAt ?? null,
-      command: state.command ?? null,
+      commandHash: state.commandHash ?? null,
     })
   );
 }
@@ -212,7 +228,7 @@ export function clearWebRuntime(): void {
 
 export function markWebInterrupted(): void {
   const state = readWebRuntime();
-  writeWebRuntime({ ...state, status: "interrupted", pid: null, processStartedAt: null, command: null });
+  writeWebRuntime({ ...state, status: "interrupted", pid: null, processStartedAt: null, commandHash: null });
 }
 
 export const WEB_STOP_WAIT_MS = 10_000;

@@ -9,9 +9,13 @@ import {
   isTemporaryChatProven,
   sessionIsReady,
   watchSentTurn,
+  mergeSeenTurns,
+  copySendBaseline,
+  newBoundUserTurns,
   type ChatGptSnapshot,
   type SendBaseline,
 } from "../src/web/selectors.js";
+import { waitForSignal } from "../src/web/session.js";
 import { resolveBrowserExecutable } from "../src/web/browser.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -33,6 +37,7 @@ function snapshot(over: Partial<ChatGptSnapshot> = {}): ChatGptSnapshot {
     userTurnIds: [],
     assistantTurnIds: [],
     assistantIdByContainer: {},
+    userIdByContainer: {},
     stopVisible: false,
     streaming: false,
     assistantTextById: {},
@@ -41,7 +46,7 @@ function snapshot(over: Partial<ChatGptSnapshot> = {}): ChatGptSnapshot {
 }
 
 function baseline(over: Partial<SendBaseline> = {}): SendBaseline {
-  return { assistantTurnIds: [], turnContainerIds: [], userTurnIds: [], ...over };
+  return { assistantTurnIds: [], turnContainerIds: [], userTurnIds: [], userIdByContainer: {}, ...over };
 }
 
 describe("ChatGPT page fixtures", () => {
@@ -102,6 +107,7 @@ describe("ChatGPT page fixtures", () => {
       assistantTurnIds: ["old-turn"],
       turnContainerIds: ["c-old", "c-hidden"],
       userTurnIds: ["u-old"],
+      userIdByContainer: { "c-old": "u-old" },
     });
     expect(
       watchSentTurn(
@@ -110,6 +116,7 @@ describe("ChatGPT page fixtures", () => {
           userTurnIds: ["u-old", "u-new"],
           turnContainerIds: ["c-old", "c-hidden", "c-new"],
           assistantTurnIds: ["old-turn", "new-turn"],
+          userIdByContainer: { "c-old": "u-old", "c-new": "u-new" },
           assistantIdByContainer: { "c-old": "old-turn", "c-new": "new-turn" },
           streaming: true,
           assistantTextById: { "new-turn": "partial" },
@@ -123,6 +130,7 @@ describe("ChatGPT page fixtures", () => {
           userTurnIds: ["u-old", "u-new"],
           turnContainerIds: ["c-old", "c-hidden", "c-new"],
           assistantTurnIds: ["old-turn", "new-turn"],
+          userIdByContainer: { "c-old": "u-old", "c-new": "u-new" },
           assistantIdByContainer: { "c-old": "old-turn", "c-new": "new-turn" },
           assistantTextById: { "new-turn": "final answer" },
         })
@@ -182,6 +190,7 @@ describe("ChatGPT page fixtures", () => {
           userTurnIds: ["u-new"],
           turnContainerIds: ["c-old", "c-new-1", "c-new-2"],
           assistantTurnIds: ["old-turn", "n1", "n2"],
+          userIdByContainer: { "c-new-1": "u-new" },
           assistantIdByContainer: { "c-old": "old-turn", "c-new-1": "n1", "c-new-2": "n2" },
           assistantTextById: { n1: "one", n2: "two" },
         })
@@ -216,11 +225,51 @@ describe("ChatGPT page fixtures", () => {
           userTurnIds: ["u-new"],
           turnContainerIds: ["c-old", "c-new"],
           assistantTurnIds: ["old-turn"],
+          userIdByContainer: { "c-new": "u-new" },
           assistantIdByContainer: { "c-new": "old-turn" },
           assistantTextById: { "old-turn": "same id in new container" },
         })
       )
     ).toMatchObject({ status: "fail", code: "WEB_TURN_STATE_UNKNOWN" });
+  });
+
+  it("detects a user turn that arrived before passive wait starts", () => {
+    const seen = baseline({
+      userTurnIds: ["u-boot"],
+      turnContainerIds: ["c-boot"],
+      assistantTurnIds: ["a-boot"],
+      userIdByContainer: { "c-boot": "u-boot" },
+    });
+    const early = snapshot({
+      userTurnIds: ["u-boot", "u-early"],
+      turnContainerIds: ["c-boot", "c-early"],
+      assistantTurnIds: ["a-boot", "a-early"],
+      userIdByContainer: { "c-boot": "u-boot", "c-early": "u-early" },
+      assistantIdByContainer: { "c-boot": "a-boot", "c-early": "a-early" },
+      assistantTextById: { "a-early": "early reply" },
+    });
+    expect(watchSentTurn(seen, early)).toMatchObject({ status: "complete", id: "a-early", text: "early reply" });
+    expect(watchSentTurn(mergeSeenTurns(seen, early), early).status).toBe("waiting");
+    expect(watchSentTurn(copySendBaseline(seen), early)).toMatchObject({ status: "complete", id: "a-early" });
+  });
+
+  it("does not treat an old-container user remount as a new human turn", () => {
+    const before = baseline({
+      userTurnIds: ["u-visible"],
+      turnContainerIds: ["c-visible", "c-hidden"],
+      assistantTurnIds: ["a-visible"],
+      userIdByContainer: { "c-visible": "u-visible" },
+    });
+    const after = snapshot({
+        userTurnIds: ["u-visible", "u-hidden"],
+        turnContainerIds: ["c-visible", "c-hidden"],
+        assistantTurnIds: ["a-visible", "a-hidden"],
+        userIdByContainer: { "c-visible": "u-visible", "c-hidden": "u-hidden" },
+        assistantIdByContainer: { "c-visible": "a-visible", "c-hidden": "a-hidden" },
+        assistantTextById: { "a-hidden": "stale user remount" },
+      });
+    expect(watchSentTurn(before, after).status).toBe("waiting");
+    expect(newBoundUserTurns(before, after)).toEqual([]);
   });
 
   it("treats login or drift after send as WEB_TURN_STATE_UNKNOWN", () => {
@@ -249,6 +298,27 @@ describe("duplicate-send guard", () => {
     }
     guard.markAcknowledged();
     expect(() => guard.assertCanSend()).not.toThrow();
+  });
+
+  it("removes abort listeners when waitForSignal resolves", async () => {
+    const ac = new AbortController();
+    let removed = 0;
+    const orig = ac.signal.removeEventListener.bind(ac.signal);
+    ac.signal.removeEventListener = ((type: string, listener: EventListenerOrEventListenerObject, options?: boolean | EventListenerOptions) => {
+      if (type === "abort") removed += 1;
+      return orig(type, listener, options);
+    }) as AbortSignal["removeEventListener"];
+    await waitForSignal(ac.signal, 15);
+    expect(removed).toBe(1);
+    ac.abort();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  });
+
+  it("does not merge the current snapshot into the passive wait baseline", () => {
+    const source = fs.readFileSync(path.join(root, "src/web/session.ts"), "utf8");
+    const passive = source.split("async waitForNextManualExchange")[1]?.split("private assertUniqueVisibleTurns")[0] ?? "";
+    expect(passive).toContain("copySendBaseline(this.seen)");
+    expect(passive).not.toContain("mergeSeenTurns(this.seen, before)");
   });
 });
 

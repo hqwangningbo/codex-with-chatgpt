@@ -10,6 +10,7 @@ import {
   uniqueIds,
   watchSentTurn,
   mergeSeenTurns,
+  copySendBaseline,
   EMPTY_SEND_BASELINE,
   type ChatGptSnapshot,
   type SendBaseline,
@@ -85,15 +86,28 @@ export interface SendWaitOptions {
   multipleUserTurns?: "ambiguous" | "concurrent";
 }
 
-async function waitForSignal(signal: AbortSignal | undefined, ms: number): Promise<void> {
+export async function waitForSignal(signal: AbortSignal | undefined, ms: number): Promise<void> {
   if (signal?.aborted) throw new WebError("WEB_TIMEOUT", "Web session was cancelled");
   await new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(resolve, ms);
+    if (!signal) {
+      setTimeout(resolve, ms);
+      return;
+    }
+    let settled = false;
     const onAbort = (): void => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
       reject(new WebError("WEB_TIMEOUT", "Web session was cancelled"));
     };
-    signal?.addEventListener("abort", onAbort, { once: true });
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener("abort", onAbort);
   });
 }
 
@@ -225,7 +239,7 @@ export class PlaywrightChatSession implements InteractiveChatSession {
     const before = await this.snapshot();
     if (!sessionIsReady(before)) failFromSnapshot(before);
     this.assertUniqueVisibleTurns(before);
-    const baseline = mergeSeenTurns(this.seen, before);
+    const baseline = copySendBaseline(this.seen);
     return this.waitForBoundExchange(
       baseline,
       { ...opts, multipleUserTurns: opts.multipleUserTurns ?? "concurrent", timeoutMs: opts.timeoutMs ?? 0 },

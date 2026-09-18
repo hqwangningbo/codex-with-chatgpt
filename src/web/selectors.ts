@@ -36,6 +36,7 @@ export interface ChatGptSnapshot {
   userTurnIds: string[];
   assistantTurnIds: string[];
   assistantIdByContainer: Record<string, string>;
+  userIdByContainer: Record<string, string>;
   stopVisible: boolean;
   streaming: boolean;
   assistantTextById: Record<string, string>;
@@ -116,6 +117,7 @@ export interface SendBaseline {
   assistantTurnIds: string[];
   turnContainerIds: string[];
   userTurnIds: string[];
+  userIdByContainer: Record<string, string>;
 }
 
 export type SentTurnWatch =
@@ -132,6 +134,16 @@ export function sendBaselineFrom(snapshot: ChatGptSnapshot): SendBaseline {
     assistantTurnIds: snapshot.assistantTurnIds,
     turnContainerIds: snapshot.turnContainerIds,
     userTurnIds: snapshot.userTurnIds,
+    userIdByContainer: { ...snapshot.userIdByContainer },
+  };
+}
+
+export function copySendBaseline(seen: SendBaseline): SendBaseline {
+  return {
+    assistantTurnIds: [...seen.assistantTurnIds],
+    turnContainerIds: [...seen.turnContainerIds],
+    userTurnIds: [...seen.userTurnIds],
+    userIdByContainer: { ...seen.userIdByContainer },
   };
 }
 
@@ -139,10 +151,15 @@ export function mergeSeenTurns(seen: SendBaseline, snapshot: ChatGptSnapshot): S
   const merge = (previous: string[], next: string[]): string[] => [
     ...new Set([...previous, ...next.filter((id) => id && id.trim())]),
   ];
+  const userIdByContainer = { ...seen.userIdByContainer };
+  for (const [containerId, userId] of Object.entries(snapshot.userIdByContainer)) {
+    if (containerId && userId) userIdByContainer[containerId] = userId;
+  }
   return {
     userTurnIds: merge(seen.userTurnIds, snapshot.userTurnIds),
     assistantTurnIds: merge(seen.assistantTurnIds, snapshot.assistantTurnIds),
     turnContainerIds: merge(seen.turnContainerIds, snapshot.turnContainerIds),
+    userIdByContainer,
   };
 }
 
@@ -150,7 +167,23 @@ export const EMPTY_SEND_BASELINE: SendBaseline = {
   assistantTurnIds: [],
   turnContainerIds: [],
   userTurnIds: [],
+  userIdByContainer: {},
 };
+
+/** New human turns must appear in a new logical container, not an old remount. */
+export function newBoundUserTurns(
+  baseline: SendBaseline,
+  snapshot: ChatGptSnapshot
+): { containerId: string; userId: string }[] {
+  const containers = uniqueIds(snapshot.turnContainerIds);
+  if (!containers.ok) return [];
+  const bound: { containerId: string; userId: string }[] = [];
+  for (const containerId of newLogicalIds(baseline.turnContainerIds, containers.ids)) {
+    const userId = snapshot.userIdByContainer[containerId];
+    if (userId && userId.trim()) bound.push({ containerId, userId });
+  }
+  return bound;
+}
 
 /**
  * After a send click, bind the reply to a unique new logical container.
@@ -186,11 +219,14 @@ export function watchSentTurn(baseline: SendBaseline, snapshot: ChatGptSnapshot)
     };
   }
 
-  const newUsers = users.ok ? newLogicalIds(baseline.userTurnIds, users.ids) : [];
-  if (newUsers.length > 1) {
+  const boundUsers = newBoundUserTurns(baseline, snapshot);
+  if (boundUsers.length > 1) {
     return { status: "fail", code: "WEB_TURN_AMBIGUOUS", reason: "multiple_user_turns" };
   }
-  if (newUsers.length === 0) return { status: "waiting" };
+  if (boundUsers.length === 0) return { status: "waiting" };
+  if (baseline.userTurnIds.includes(boundUsers[0].userId)) {
+    return { status: "fail", code: "WEB_TURN_STATE_UNKNOWN" };
+  }
 
   const newContainers = newLogicalIds(baseline.turnContainerIds, containers.ids);
   const newAssistants = assistants.ok ? newLogicalIds(baseline.assistantTurnIds, assistants.ids) : [];
@@ -256,11 +292,15 @@ export function extractChatGptSnapshot(): ChatGptSnapshot {
     return node.getAttribute("aria-disabled") === "true" || node.getAttribute("contenteditable") === "false";
   });
   const assistantIdByContainer: Record<string, string> = {};
+  const userIdByContainer: Record<string, string> = {};
   for (const container of containers) {
     const containerId = container.getAttribute("data-turn-id-container") ?? "";
     const assistant = container.querySelector('[data-message-author-role="assistant"][data-turn-id], [data-turn="assistant"][data-turn-id]');
     const assistantId = assistant?.getAttribute("data-turn-id") ?? "";
     if (containerId && assistantId) assistantIdByContainer[containerId] = assistantId;
+    const user = container.querySelector('[data-message-author-role="user"][data-turn-id], [data-turn="user"][data-turn-id]');
+    const userId = user?.getAttribute("data-turn-id") ?? "";
+    if (containerId && userId) userIdByContainer[containerId] = userId;
   }
   let temporaryFromUrl = false;
   try {
@@ -290,6 +330,7 @@ export function extractChatGptSnapshot(): ChatGptSnapshot {
     userTurnIds: ids('[data-message-author-role="user"][data-turn-id], [data-turn="user"][data-turn-id]', "data-turn-id"),
     assistantTurnIds: assistantTurns.map((el) => el.getAttribute("data-turn-id") ?? ""),
     assistantIdByContainer,
+    userIdByContainer,
     stopVisible: [...document.querySelectorAll('button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="停止生成"]')].some(visible),
     streaming: Boolean(document.querySelector('[data-streaming-response-status], [data-state="streaming"]')),
     assistantTextById,

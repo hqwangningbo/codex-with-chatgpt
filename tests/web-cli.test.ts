@@ -9,7 +9,7 @@ import { Workspace } from "../src/workspace/manager.js";
 import type { ChatSession } from "../src/web/session.js";
 import type { ChatGptSnapshot } from "../src/web/selectors.js";
 import { ACTION_CLOSE, ACTION_OPEN, WEB_PROTOCOL } from "../src/web/protocol.js";
-import { inspectProcess, isWebHarnessCommand, isWebResearchCommand, readWebRuntime, stopWebTask, writeWebRuntime } from "../src/web/state.js";
+import { inspectProcess, isWebHarnessCommand, isWebResearchCommand, hashOwnerCommand, readWebRuntime, stopWebTask, writeWebRuntime, webRuntimeFile } from "../src/web/state.js";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const cliEntry = path.join(projectRoot, "src/cli/index.ts");
@@ -111,7 +111,7 @@ describe("web stop PID identity", () => {
       workspaceId: "ws",
       startedAt: new Date().toISOString(),
       processStartedAt: "Mon Jan  1 00:00:00 2000",
-      command: `${process.execPath} src/cli/index.ts web research --task x`,
+      commandHash: "dead",
       stepCount: 1,
       status: "running",
     });
@@ -139,7 +139,8 @@ describe("web stop PID identity", () => {
         workspaceId: "ws",
         startedAt: new Date().toISOString(),
         processStartedAt: live.startedAt,
-        command: `${process.execPath} src/cli/index.ts web research --task reused`,
+        commandHash: "not-the-live-process",
+        kind: "research",
         stepCount: 1,
         status: "running",
       });
@@ -201,7 +202,8 @@ async function recordFakeOwner(child: ReturnType<typeof spawn>): Promise<void> {
     workspaceId: "ws",
     startedAt: new Date().toISOString(),
     processStartedAt: live.startedAt,
-    command: live.command,
+    commandHash: hashOwnerCommand(live.command ?? ""),
+    kind: isWebResearchCommand(live.command) ? "research" : "chat",
     stepCount: 1,
     status: "running",
   });
@@ -314,6 +316,28 @@ describe("web harness command identity", () => {
     expect(isWebHarnessCommand("node src/cli/index.ts web stop --json")).toBe(false);
     expect(isWebResearchCommand("node src/cli/index.js web chat")).toBe(false);
   });
+
+  it("does not persist research task text in runtime.json", () => {
+    process.env.C2C_STATE_DIR = stateDir;
+    const secret = "UNIQUE_PRIVACY_TOKEN_c2c_task_xyz";
+    const command = `${process.execPath} src/cli/index.ts web research --task ${JSON.stringify(secret)}`;
+    writeWebRuntime({
+      pid: 424242,
+      requestId: "c2c_wr_private",
+      workspaceId: "ws",
+      startedAt: new Date().toISOString(),
+      processStartedAt: "Mon Jan  1 00:00:00 2000",
+      commandHash: hashOwnerCommand(command),
+      kind: "research",
+      stepCount: 1,
+      status: "running",
+    });
+    const raw = fs.readFileSync(webRuntimeFile(), "utf8");
+    expect(raw).not.toContain(secret);
+    expect(raw).not.toContain("--task");
+    expect(JSON.parse(raw).command).toBeUndefined();
+    expect(JSON.parse(raw).commandHash).toBe(hashOwnerCommand(command));
+  });
 });
 
 class FakeSession implements ChatSession {
@@ -338,6 +362,7 @@ class FakeSession implements ChatSession {
       userTurnIds: [],
       assistantTurnIds: [],
       assistantIdByContainer: {},
+      userIdByContainer: {},
       stopVisible: false,
       streaming: false,
       assistantTextById: {},

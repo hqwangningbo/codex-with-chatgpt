@@ -14,7 +14,7 @@ import {
   WEB_PROTOCOL,
 } from "../src/web/protocol.js";
 import { CHAT_READY } from "../src/web/prompt.js";
-import { runWebChat } from "../src/web/chat-turn.js";
+import { CHAIN_MAX_STEPS, runWebChat } from "../src/web/chat-turn.js";
 import type { InteractiveChatSession } from "../src/web/session.js";
 import type { ChatGptSnapshot } from "../src/web/selectors.js";
 import { watchSentTurn } from "../src/web/selectors.js";
@@ -37,6 +37,7 @@ function snapshot(over: Partial<ChatGptSnapshot> = {}): ChatGptSnapshot {
     userTurnIds: [],
     assistantTurnIds: [],
     assistantIdByContainer: {},
+    userIdByContainer: {},
     stopVisible: false,
     streaming: false,
     assistantTextById: {},
@@ -68,6 +69,8 @@ class FakeChatSession implements InteractiveChatSession {
   sendReplies: Scripted[] = [];
   humanQueue: Scripted[] = [];
   userTurns: string[] = [];
+  containerIds: string[] = [];
+  userByContainer: Record<string, string> = {};
   injectAfterSnapshots = -1;
   concurrentOnNextHuman = false;
   onAfterBootstrap?: () => void;
@@ -79,25 +82,40 @@ class FakeChatSession implements InteractiveChatSession {
     return typeof item === "function" ? item(this.sessionId) : item;
   }
 
+  private recordUser(id: string): void {
+    const container = `c-${id}`;
+    this.userTurns.push(id);
+    this.containerIds.push(container);
+    this.userByContainer[container] = id;
+  }
+
+  private currentSnapshot(): ChatGptSnapshot {
+    return snapshot({
+      userTurnIds: [...this.userTurns],
+      turnContainerIds: [...this.containerIds],
+      userIdByContainer: { ...this.userByContainer },
+    });
+  }
+
   async snapshot(): Promise<ChatGptSnapshot> {
     if (this.injectAfterSnapshots === 0) {
       this.injectAfterSnapshots = -1;
-      this.userTurns.push("u-concurrent");
+      this.recordUser("u-concurrent");
     } else if (this.injectAfterSnapshots > 0) {
       this.injectAfterSnapshots -= 1;
     }
-    return snapshot({ userTurnIds: [...this.userTurns] });
+    return this.currentSnapshot();
   }
 
   async ensureReady(): Promise<ChatGptSnapshot> {
-    return snapshot({ userTurnIds: [...this.userTurns] });
+    return this.currentSnapshot();
   }
 
   async sendAndWait(text: string): Promise<string> {
     this.sent.push(text);
     const match = text.match(/^session_id: (\S+)$/m);
     if (match) this.sessionId = match[1];
-    this.userTurns.push(`u-harness-${this.n++}`);
+    this.recordUser(`u-harness-${this.n++}`);
     const next = this.sendReplies.shift();
     if (next === undefined) throw new Error("no scripted send reply");
     const reply = this.resolve(next);
@@ -111,7 +129,7 @@ class FakeChatSession implements InteractiveChatSession {
       this.ac.abort();
       throw new WebError("WEB_TIMEOUT", "Web session was cancelled");
     }
-    this.userTurns.push(`u-human-${this.n++}`);
+    this.recordUser(`u-human-${this.n++}`);
     if (this.concurrentOnNextHuman) this.injectAfterSnapshots = 1;
     return this.resolve(next);
   }
@@ -273,6 +291,37 @@ describe("web chat loop", () => {
     expect(session.sent).toHaveLength(1);
     expect(session.sent.join("\n")).not.toContain("<C2C_TOOL_RESULT>");
   });
+
+  it("gives each human exchange a fresh 30-step tool budget", async () => {
+    const turns = CHAIN_MAX_STEPS + 1;
+    const { result, session } = await runScriptedChat({
+      root,
+      sendReplies: [CHAT_READY, ...Array.from({ length: turns }, () => "ok")],
+      humanQueue: Array.from(
+        { length: turns },
+        (_, i) => (id: string) => chatEnvelope(id, "workspace_info", {}, `human-${i}`)
+      ),
+    });
+    expect(result.status).toBe("interrupted");
+    expect(result.steps).toBe(turns);
+    expect(session.sent.filter((item) => item.includes("<C2C_TOOL_RESULT>"))).toHaveLength(turns);
+  });
+
+  it("fails a single continuous chain after 30 local tools", async () => {
+    const { result, session } = await runScriptedChat({
+      root,
+      sendReplies: [
+        CHAT_READY,
+        ...Array.from(
+          { length: CHAIN_MAX_STEPS },
+          (_, i) => (id: string) => chatEnvelope(id, "workspace_info", {}, `chain-${i + 1}`)
+        ),
+      ],
+      humanQueue: [(id) => chatEnvelope(id, "workspace_info", {}, "chain-0")],
+    });
+    expect(result.steps).toBe(CHAIN_MAX_STEPS);
+    expect(session.sent.filter((item) => item.includes("<C2C_TOOL_RESULT>"))).toHaveLength(CHAIN_MAX_STEPS);
+  });
 });
 
 describe("web chat writable dispatcher", () => {
@@ -396,6 +445,7 @@ describe("web chat remount safety", () => {
         assistantTurnIds: ["visible-old"],
         turnContainerIds: ["c-visible", "c-hidden"],
         userTurnIds: ["u-old"],
+        userIdByContainer: { "c-visible": "u-old" },
       },
       snapshot({
         userTurnIds: ["u-old"],
@@ -412,7 +462,7 @@ describe("web chat remount safety", () => {
 
   it("fail-closes duplicate user turn ids", () => {
     const watched = watchSentTurn(
-      { assistantTurnIds: [], turnContainerIds: [], userTurnIds: [] },
+      { assistantTurnIds: [], turnContainerIds: [], userTurnIds: [], userIdByContainer: {} },
       snapshot({
         userTurnIds: ["u-1", "u-1"],
         turnContainerIds: ["c-new"],

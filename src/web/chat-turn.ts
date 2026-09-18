@@ -14,7 +14,7 @@ import {
 } from "./protocol.js";
 import { CHAT_READY, chatBootstrapPrompt } from "./prompt.js";
 import type { InteractiveChatSession } from "./session.js";
-import { newLogicalIds, uniqueIds } from "./selectors.js";
+import { uniqueIds, mergeSeenTurns, newBoundUserTurns, copySendBaseline, type SendBaseline } from "./selectors.js";
 import { activeWebTask, observeWebTask, writeWebRuntime } from "./state.js";
 
 export interface ChatInput {
@@ -31,7 +31,7 @@ export interface ChatResult {
   error?: { code: string; message: string };
 }
 
-const CHAIN_MAX_STEPS = 30;
+export const CHAIN_MAX_STEPS = 30;
 
 export async function runWebChat(input: ChatInput): Promise<ChatResult> {
   const observation = observeWebTask();
@@ -51,16 +51,16 @@ export async function runWebChat(input: ChatInput): Promise<ChatResult> {
   writeRuntime(input.workspace.id, sessionId, 0, "running");
 
   const seenCallIds = new Set<string>();
-  let steps = 0;
-  let knownUsers: string[] = [];
+  let totalSteps = 0;
+  let seenTurns: SendBaseline = copySendBaseline({
+    assistantTurnIds: [],
+    turnContainerIds: [],
+    userTurnIds: [],
+    userIdByContainer: {},
+  });
 
-  const syncKnownUsers = async (): Promise<void> => {
-    const snap = await input.session.snapshot();
-    knownUsers = [...new Set([...knownUsers, ...snap.userTurnIds.filter((id) => id && id.trim())])];
-  };
-
-  const absorbVisibleTurns = async (): Promise<void> => {
-    await syncKnownUsers();
+  const syncKnownTurns = async (): Promise<void> => {
+    seenTurns = mergeSeenTurns(seenTurns, await input.session.snapshot());
   };
 
   const assertNoConcurrentUser = async (): Promise<void> => {
@@ -72,7 +72,7 @@ export async function runWebChat(input: ChatInput): Promise<ChatResult> {
         "ChatGPT user turns were not unique during the tool chain"
       );
     }
-    if (newLogicalIds(knownUsers, live.ids).length > 0) {
+    if (newBoundUserTurns(seenTurns, snap).length > 0) {
       throw new WebError(
         "WEB_CHAT_CONCURRENT_USER_TURN",
         "A new human user turn arrived while a tool chain was active"
@@ -83,6 +83,7 @@ export async function runWebChat(input: ChatInput): Promise<ChatResult> {
   const processAssistant = async (text: string): Promise<void> => {
     let correctionUsed = false;
     let reply = text;
+    let chainSteps = 0;
     for (;;) {
       if (input.signal?.aborted) throw new WebError("WEB_TIMEOUT", "Web session was cancelled");
       const parsed = parseChatAssistantAction(reply, sessionId, seenCallIds);
@@ -95,18 +96,19 @@ export async function runWebChat(input: ChatInput): Promise<ChatResult> {
             signal: input.signal,
             multipleUserTurns: "concurrent",
           });
-          await syncKnownUsers();
+          await syncKnownTurns();
           continue;
         }
         throw new WebError("WEB_PROTOCOL_INVALID", parsed.message);
       }
-      if (steps >= CHAIN_MAX_STEPS) {
+      if (chainSteps >= CHAIN_MAX_STEPS) {
         throw new WebError("WEB_MAX_STEPS_REACHED", `Reached max_steps=${CHAIN_MAX_STEPS} for this tool chain`);
       }
       await assertNoConcurrentUser();
       seenCallIds.add(parsed.action.call_id);
-      steps += 1;
-      writeRuntime(input.workspace.id, sessionId, steps, "running");
+      chainSteps += 1;
+      totalSteps += 1;
+      writeRuntime(input.workspace.id, sessionId, totalSteps, "running");
       const dispatched = await dispatchWebTool(input.workspace, snapshot, parsed.action);
       await assertNoConcurrentUser();
       reply = await input.session.sendAndWait(
@@ -120,14 +122,14 @@ export async function runWebChat(input: ChatInput): Promise<ChatResult> {
         }),
         { signal: input.signal, multipleUserTurns: "concurrent" }
       );
-      await syncKnownUsers();
+      await syncKnownTurns();
       correctionUsed = false;
     }
   };
 
   try {
     await input.session.ensureReady();
-    await syncKnownUsers();
+    await syncKnownTurns();
     const ready = await input.session.sendAndWait(
       chatBootstrapPrompt({
         sessionId,
@@ -136,7 +138,7 @@ export async function runWebChat(input: ChatInput): Promise<ChatResult> {
       }),
       { signal: input.signal }
     );
-    await syncKnownUsers();
+    await syncKnownTurns();
     if (ready.trim() !== CHAT_READY) {
       throw new WebError("WEB_PROTOCOL_INVALID", "Chat bootstrap did not reply C2C CHAT READY");
     }
@@ -150,29 +152,29 @@ export async function runWebChat(input: ChatInput): Promise<ChatResult> {
         if (input.signal?.aborted) break;
         throw error;
       }
-      await syncKnownUsers();
+      await syncKnownTurns();
       try {
         await processAssistant(text);
       } catch (error) {
         if (error instanceof WebError && recoverableChatError(error.code)) {
-          await absorbVisibleTurns();
+          await syncKnownTurns();
           continue;
         }
         throw error;
       }
     }
 
-    writeRuntime(input.workspace.id, sessionId, steps, "interrupted", true);
-    return { sessionId, status: "interrupted", steps };
+    writeRuntime(input.workspace.id, sessionId, totalSteps, "interrupted", true);
+    return { sessionId, status: "interrupted", steps: totalSteps };
   } catch (error) {
     const code = error instanceof WebError ? error.code : "INTERNAL_ERROR";
     const message = error instanceof Error ? error.message : String(error);
     const interrupted = input.signal?.aborted || code === "WEB_TIMEOUT";
-    writeRuntime(input.workspace.id, sessionId, steps, interrupted ? "interrupted" : "failed", true);
+    writeRuntime(input.workspace.id, sessionId, totalSteps, interrupted ? "interrupted" : "failed", true);
     return {
       sessionId,
       status: interrupted ? "interrupted" : "failed",
-      steps,
+      steps: totalSteps,
       error: { code, message },
     };
   }
