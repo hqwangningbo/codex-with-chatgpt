@@ -87,6 +87,27 @@ export interface SendWaitOptions {
   multipleUserTurns?: "ambiguous" | "concurrent";
 }
 
+export function isTransientNavigationSnapshotError(error: unknown): boolean {
+  if (error instanceof WebError) return false;
+  const message = (error instanceof Error ? error.message : String(error ?? "")).toLowerCase();
+  if (!message.trim()) return false;
+  if (
+    message.includes("target closed") ||
+    message.includes("browser has been closed") ||
+    message.includes("context has been closed") ||
+    message.includes("page has been closed") ||
+    /\btimeout\b/.test(message)
+  ) {
+    return false;
+  }
+  return (
+    message.includes("execution context was destroyed") ||
+    message.includes("most likely because of a navigation") ||
+    message.includes("cannot find context with specified id") ||
+    message.includes("frame context was destroyed due to navigation")
+  );
+}
+
 export async function waitForSignal(signal: AbortSignal | undefined, ms: number): Promise<void> {
   if (signal?.aborted) throw new WebError("WEB_TIMEOUT", "Web session was cancelled");
   await new Promise<void>((resolve, reject) => {
@@ -206,7 +227,17 @@ export class PlaywrightChatSession implements InteractiveChatSession {
     const deadline = Date.now() + (this.loginMode ? 10 * 60_000 : 45_000);
     while (Date.now() < deadline) {
       this.throwIfDrifted();
-      const snapshot = await this.snapshot();
+      let snapshot: ChatGptSnapshot;
+      try {
+        snapshot = await this.snapshot();
+      } catch (error) {
+        if (isTransientNavigationSnapshotError(error)) {
+          this.throwIfDrifted();
+          await waitForSignal(undefined, 250);
+          continue;
+        }
+        throw error;
+      }
       const kind = classifyPage(snapshot);
       if (kind === "challenge" || kind === "rate_limit" || kind === "usage_limit") failFromSnapshot(snapshot);
       if (sessionIsReady(snapshot)) {

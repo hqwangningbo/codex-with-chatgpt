@@ -16,7 +16,7 @@ import {
   type ChatGptSnapshot,
   type SendBaseline,
 } from "../src/web/selectors.js";
-import { waitForSignal } from "../src/web/session.js";
+import { waitForSignal, PlaywrightChatSession, isTransientNavigationSnapshotError } from "../src/web/session.js";
 import { resolveBrowserExecutable } from "../src/web/browser.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -438,3 +438,138 @@ describe("browser navigation allowlist", () => {
     expect(navigationDecision("https://accounts.google.com/o/oauth2", "login")).toBe("allow");
   });
 });
+
+const NAV_DESTROYED = "page.evaluate: Execution context was destroyed, most likely because of a navigation";
+
+function loginSnapshot(): ChatGptSnapshot {
+  return snapshot({
+    href: "https://chatgpt.com/auth/login",
+    origin: "https://chatgpt.com",
+    composerCount: 0,
+    profilePresent: false,
+    temporaryChat: false,
+    loginSurface: true,
+  });
+}
+
+function fakeLoginSession(evaluate: () => Promise<ChatGptSnapshot>) {
+  let href = "https://chatgpt.com/?temporary-chat=true";
+  const mainFrame = { url: () => href };
+  const frameNav: Array<(frame: typeof mainFrame) => void> = [];
+  const page = {
+    url: () => href,
+    mainFrame: () => mainFrame,
+    on(event: string, handler: (frame: typeof mainFrame) => void) {
+      if (event === "framenavigated") frameNav.push(handler);
+    },
+    goto: async () => undefined,
+    waitForTimeout: async () => undefined,
+    close: async () => undefined,
+    evaluate,
+  };
+  const context = {
+    pages: () => [page],
+    on: () => undefined,
+    close: async () => undefined,
+  };
+  const session = new PlaywrightChatSession(context as never, page as never, true);
+  return {
+    session,
+    navigate(url: string) {
+      href = url;
+      for (const handler of frameNav) handler(mainFrame);
+    },
+  };
+}
+
+describe("login snapshot navigation race", () => {
+  it("matches only explicit navigation context destruction", () => {
+    expect(isTransientNavigationSnapshotError(new Error(NAV_DESTROYED))).toBe(true);
+    expect(isTransientNavigationSnapshotError(new Error("Cannot find context with specified id"))).toBe(true);
+    expect(isTransientNavigationSnapshotError(new Error("frame context was destroyed due to navigation"))).toBe(true);
+    expect(isTransientNavigationSnapshotError(new Error("page.evaluate: boom"))).toBe(false);
+    expect(isTransientNavigationSnapshotError(new Error("Target closed"))).toBe(false);
+    expect(
+      isTransientNavigationSnapshotError(
+        new Error("page.evaluate: Target page, context or browser has been closed")
+      )
+    ).toBe(false);
+    expect(isTransientNavigationSnapshotError(new Error("Timeout 30000ms exceeded"))).toBe(false);
+    expect(isTransientNavigationSnapshotError(new WebError("WEB_UI_DRIFT", "Blocked navigation"))).toBe(false);
+    expect(isTransientNavigationSnapshotError(new WebError("WEB_CHALLENGE", "challenge"))).toBe(false);
+    expect(isTransientNavigationSnapshotError(new WebError("WEB_RATE_LIMIT", "rate"))).toBe(false);
+    expect(isTransientNavigationSnapshotError(new WebError("WEB_LOGIN_EXPIRED", "login"))).toBe(false);
+  });
+
+  it("retries a destroyed execution context until Temporary Chat is ready", async () => {
+    const replies: Array<Error | ChatGptSnapshot> = [
+      new Error(NAV_DESTROYED),
+      loginSnapshot(),
+      snapshot(),
+    ];
+    const { session } = fakeLoginSession(async () => {
+      const next = replies.shift();
+      if (next instanceof Error) throw next;
+      if (!next) throw new Error("unexpected extra snapshot");
+      return next;
+    });
+    await expect(session.ensureReady()).resolves.toMatchObject({
+      href: "https://chatgpt.com/?temporary-chat=true",
+      profilePresent: true,
+    });
+    expect(replies).toEqual([]);
+  });
+
+  it("keeps retrying consecutive transient navigation errors", async () => {
+    const replies: Array<Error | ChatGptSnapshot> = [
+      new Error(NAV_DESTROYED),
+      new Error("Cannot find context with specified id"),
+      snapshot(),
+    ];
+    const { session } = fakeLoginSession(async () => {
+      const next = replies.shift();
+      if (next instanceof Error) throw next;
+      if (!next) throw new Error("unexpected extra snapshot");
+      return next;
+    });
+    await expect(session.ensureReady()).resolves.toMatchObject({ profilePresent: true });
+    expect(replies).toEqual([]);
+  });
+
+  it("throws an unknown evaluate error immediately", async () => {
+    const { session } = fakeLoginSession(async () => {
+      throw new Error("page.evaluate: unexpected crash");
+    });
+    await expect(session.ensureReady()).rejects.toThrow("page.evaluate: unexpected crash");
+  });
+
+  it("fail-closes WEB_UI_DRIFT set during a transient navigation error", async () => {
+    let navigate = (_url: string): void => undefined;
+    const fake = fakeLoginSession(async () => {
+      navigate("https://evil.example/popup");
+      throw new Error(NAV_DESTROYED);
+    });
+    navigate = fake.navigate;
+    await expect(fake.session.ensureReady()).rejects.toMatchObject({
+      code: "WEB_UI_DRIFT",
+    });
+  });
+
+  it("does not treat a closed target as a retryable navigation", async () => {
+    const { session } = fakeLoginSession(async () => {
+      throw new Error("page.evaluate: Target page, context or browser has been closed");
+    });
+    await expect(session.ensureReady()).rejects.toThrow(/Target page, context or browser has been closed/);
+  });
+
+  it("retries navigation races only in ensureReady, not send or tool-chain waits", () => {
+    const source = fs.readFileSync(path.join(root, "src/web/session.ts"), "utf8");
+    const ready = source.split("async ensureReady")[1]?.split("async sendAndWait")[0] ?? "";
+    const send = source.split("async sendAndWait")[1]?.split("async waitForNextManualExchange")[0] ?? "";
+    const bound = source.split("private async waitForBoundExchange")[1] ?? "";
+    expect(ready).toContain("isTransientNavigationSnapshotError");
+    expect(send).not.toContain("isTransientNavigationSnapshotError");
+    expect(bound).not.toContain("isTransientNavigationSnapshotError");
+  });
+});
+
