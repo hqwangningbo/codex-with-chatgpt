@@ -154,6 +154,14 @@ export class IgnoreRules {
     this.sensitiveInodes = collectMatchingInodes(workspaceRoot, (rel) => this.nameIsSensitive(rel));
   }
 
+  exportSensitiveInodes(): Set<string> {
+    return new Set(this.sensitiveInodes);
+  }
+
+  mergeSensitiveInodes(inodes: Iterable<string>): void {
+    for (const inode of inodes) this.sensitiveInodes.add(inode);
+  }
+
   private nameIsSensitive(relPath: string): boolean {
     return this.sensitive.ignores(relPath) || this.custom.ignores(relPath);
   }

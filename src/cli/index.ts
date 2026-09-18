@@ -56,6 +56,7 @@ import {
   type WriteScopeMode,
 } from "../write-scope/state.js";
 import { registerWebCommands } from "./web.js";
+import { registerDevCommands } from "./dev.js";
 
 const program = new Command();
 
@@ -1417,6 +1418,12 @@ registerWebCommands(program, {
   resolveWorkspace,
   handleCliError,
   acceptUnusedWorkspaceOption,
+});
+
+registerDevCommands(program, {
+  say,
+  check,
+  handleCliError,
 });
 
 function handleCliError(error: unknown, json: boolean): void {

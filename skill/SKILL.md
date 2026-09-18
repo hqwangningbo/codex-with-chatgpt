@@ -14,8 +14,9 @@ manually carries short prompts and replies between them.
 ## Non-negotiable rules
 
 1. Never open, control, inspect, or automate the ChatGPT web interface for
-   Bridge, Connector, planning, or review. The only exception is the explicit
-   Web Research Harness below, and only after the user asked for `c2c web`.
+   Bridge, Connector, planning, or review. The only exceptions are the explicit
+   Web Research Harness and Multi-Workspace Dev Chat below, and only after the
+   user asked for `c2c web` or `c2c dev` Web Chat.
 2. Never create, delete, reconnect, or edit a ChatGPT Connector.
 3. Never type or send a message to ChatGPT and never read a ChatGPT reply
    except when the user pastes it into this Codex conversation, or when the
@@ -316,6 +317,73 @@ profile after explicit confirmation.
 ChatGPT Web cannot set, widen, or clear Writable Scope. Local dispatcher
 policy, `.env` denial, and POC sandbox still apply even if the model is
 prompt-injected.
+
+## Multi-Workspace Development Environment
+
+Optional. Independent of single-workspace `c2c start` / `c2c web chat`.
+Do not start this path unless the user asked to work on multiple repos
+together.
+
+Natural-language triggers:
+
+- “启动 tbpros 开发环境”
+- “把这几个项目一起给网页版 ChatGPT”
+- “同时开发 contracts 和 research”
+- “关闭开发环境”
+- “给我当前 Bridge 地址”
+
+Behavior:
+
+1. If a saved profile exists, start it by name:
+
+   `c2c dev up tbpros`
+
+2. Ordinary `dev up` must not start Browser Automation. Add `--chat` only
+   when the user explicitly asked for Web Chat / 网页版 ChatGPT.
+
+   `c2c dev up tbpros --chat`
+
+   Or, if the environment is already running:
+
+   `c2c dev chat tbpros`
+
+3. First-time setup with explicit mounts (save for next time):
+
+   `c2c dev up tbpros --mount research=<abs> --mount contracts=<abs> --mode poc --save`
+
+   Optional read-only reference repos use `--read-only alias=<abs>`.
+   Optional `--write-root alias=docs/research` narrows a mount. Default write
+   root is `.` (the whole mount). `--mode write` allows `write_file` only;
+   `--mode poc` also allows `run_poc`.
+
+4. Status and address:
+
+   `c2c dev status tbpros`
+   `c2c dev address tbpros`
+
+   Do not print canonical local roots unless the user asked for `--verbose`.
+   Prefer the public MCP URL when a verified Named Tunnel is active.
+
+5. Stop:
+
+   `c2c dev down tbpros`
+
+   This stops that environment's Bridge, Tunnel, and Web Chat. It must not
+   delete the saved profile, Browser login profile, or project files.
+
+6. Never infer sibling/parent repos. ChatGPT only sees
+   `workspace://<alias>/...`. Absolute paths stay local.
+
+7. `dev up` is the write authorization for attached rw mounts. Do not also
+   run `c2c write-scope set` for this path. Profile edits do not enlarge a
+   running session; the user must `dev down` then `dev up`.
+
+8. If `--tunnel` returns `TUNNEL_CHOICE_REQUIRED`, ask the user to choose
+   Named or Quick the same way as Daily Bridge. Never choose Quick for them.
+   Reuse the profile's Named Tunnel; do not create a new random URL.
+
+9. If `c2c web status --json` shows `profileExists: false` and the user
+   asked for `--chat`, tell them to run `c2c web login` themselves first.
 
 ## Repair
 

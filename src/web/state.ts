@@ -7,7 +7,7 @@ import { webRuntimeDir } from "./profile.js";
 import { WebError } from "./errors.js";
 
 export type WebTaskStatus = "idle" | "running" | "interrupted" | "completed" | "failed";
-export type WebHarnessKind = "research" | "chat";
+export type WebHarnessKind = "research" | "chat" | "dev";
 
 export interface WebRuntimeState {
   pid: number | null;
@@ -60,7 +60,7 @@ export function readWebRuntime(): WebRuntimeState {
     processStartedAt: safe.processStartedAt ?? null,
     commandHash: safe.commandHash ?? null,
     sessionId: safe.sessionId ?? null,
-    kind: safe.kind === "chat" || safe.kind === "research" ? safe.kind : null,
+    kind: safe.kind === "chat" || safe.kind === "research" || safe.kind === "dev" ? safe.kind : null,
   };
 }
 
@@ -137,7 +137,16 @@ export function isWebResearchCommand(command: string | null): boolean {
 }
 
 export function isWebHarnessCommand(command: string | null): boolean {
-  return isHarnessSubcommand(command, "research") || isHarnessSubcommand(command, "chat");
+  return isHarnessSubcommand(command, "research") || isHarnessSubcommand(command, "chat") || isDevHarnessCommand(command);
+}
+
+export function isDevHarnessCommand(command: string | null): boolean {
+  if (!command) return false;
+  const text = command.toLowerCase();
+  const harness = text.includes("c2c") || text.includes("cli/index.ts") || text.includes("cli/index.js");
+  if (!harness) return false;
+  if (/\bdev\s+chat\b/.test(text)) return true;
+  return /\bdev\s+up\b/.test(text) && /--chat(?:\s|$)/.test(text);
 }
 
 function isHarnessSubcommand(command: string | null, subcommand: "research" | "chat"): boolean {
@@ -149,6 +158,7 @@ function isHarnessSubcommand(command: string | null, subcommand: "research" | "c
 }
 
 function kindFromCommand(command: string | null): WebHarnessKind | null {
+  if (isDevHarnessCommand(command)) return "dev";
   if (isHarnessSubcommand(command, "chat")) return "chat";
   if (isHarnessSubcommand(command, "research")) return "research";
   return null;
