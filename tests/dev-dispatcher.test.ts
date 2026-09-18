@@ -1,19 +1,36 @@
 import fs from "node:fs";
 import path from "node:path";
+import { spawn, type ChildProcess } from "node:child_process";
 import { afterEach, describe, expect, it } from "vitest";
 import { SERVICE_NAME, VERSION } from "../src/version.js";
 import { buildProfileFromFlags, writeDevProfile } from "../src/dev/profile.js";
 import { captureDevCapability, createDevEnvironment } from "../src/dev/environment.js";
 import { dispatchDevTool } from "../src/dev/dispatcher.js";
-import { writeDevRuntime } from "../src/dev/runtime.js";
+import {
+  findDevObservation,
+  ownerIdentityFor,
+  probeDevBridge,
+  readDevRuntime,
+  writeDevRuntime,
+} from "../src/dev/runtime.js";
 import { parseDevAssistantAction } from "../src/dev/protocol.js";
 import { ACTION_CLOSE, ACTION_OPEN } from "../src/web/protocol.js";
 import { cleanup, isolateStateDir, makeGitRepo, makeTmpDir, write } from "./helpers.js";
 
 const roots: string[] = [];
 const states: string[] = [];
+const bridges: ChildProcess[] = [];
 
 afterEach(() => {
+  for (const child of bridges.splice(0)) {
+    if (child.pid) {
+      try {
+        process.kill(child.pid, "SIGKILL");
+      } catch {
+        // already gone
+      }
+    }
+  }
   for (const root of roots.splice(0)) cleanup(root);
   for (const dir of states.splice(0)) cleanup(dir);
 });
@@ -41,6 +58,146 @@ function persist(env: ReturnType<typeof createDevEnvironment>) {
   });
 }
 
+async function persistLive(
+  env: ReturnType<typeof createDevEnvironment>,
+  opts: {
+    healthStartedAt?: string;
+    recordedPid?: number;
+  } = {}
+): Promise<{ child: ChildProcess; port: number }> {
+  const scriptDir = makeTmpDir("live-bridge");
+  roots.push(scriptDir);
+  const scriptFile = path.join(scriptDir, "bridge.cjs");
+  fs.writeFileSync(
+    scriptFile,
+    `
+const http = require("node:http");
+const server = http.createServer((req, res) => {
+  if (req.url !== "/health") {
+    res.statusCode = 404;
+    res.end();
+    return;
+  }
+  res.setHeader("content-type", "application/json");
+  res.end(JSON.stringify({
+    service: process.env.DEV_SERVICE,
+    version: process.env.DEV_VERSION,
+    status: "ok",
+    workspaceId: process.env.DEV_ENV_ID,
+    environmentId: process.env.DEV_ENV_ID,
+    environmentName: process.env.DEV_ENV_NAME,
+    mountCount: 1,
+    startedAt: process.env.DEV_HEALTH_STARTED_AT,
+  }));
+});
+server.listen(0, "127.0.0.1", () => {
+  process.stdout.write(JSON.stringify({ port: server.address().port }) + "\\n");
+});
+`
+  );
+  const child = spawn(process.execPath, [scriptFile, "serve-dev", "--name", env.name], {
+    stdio: ["ignore", "pipe", "ignore"],
+    windowsHide: true,
+    env: {
+      ...process.env,
+      DEV_SERVICE: SERVICE_NAME,
+      DEV_VERSION: VERSION,
+      DEV_ENV_ID: env.environmentId,
+      DEV_ENV_NAME: env.name,
+      DEV_HEALTH_STARTED_AT: opts.healthStartedAt ?? env.startedAt,
+    },
+  });
+  bridges.push(child);
+  const port = await new Promise<number>((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        reject(new Error("live bridge did not bind"));
+      }
+    }, 5000);
+    child.stdout?.on("data", (chunk: Buffer) => {
+      if (settled) return;
+      try {
+        const parsed = JSON.parse(chunk.toString("utf8").split("\n")[0]!) as { port: number };
+        settled = true;
+        clearTimeout(timer);
+        resolve(parsed.port);
+      } catch (error) {
+        settled = true;
+        clearTimeout(timer);
+        reject(error);
+      }
+    });
+    child.on("exit", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(new Error(`live bridge exited ${code}`));
+    });
+  });
+  const pid = opts.recordedPid ?? child.pid ?? 0;
+  const deadline = Date.now() + 5000;
+  let health = await probeDevBridge(port);
+  while (!health && Date.now() < deadline) {
+    await delay(25);
+    health = await probeDevBridge(port);
+  }
+  if (!health) throw new Error("live bridge health failed");
+  let identity = ownerIdentityFor(pid);
+  while (Date.now() < deadline && (!identity.processStartedAt || !identity.commandHash)) {
+    await delay(25);
+    identity = ownerIdentityFor(pid);
+  }
+  if (!identity.processStartedAt || !identity.commandHash) {
+    throw new Error("live bridge owner identity was not available");
+  }
+  writeDevRuntime({
+    service: SERVICE_NAME,
+    version: VERSION,
+    ...captureDevCapability(env),
+    pid,
+    port,
+    adminToken: "test",
+    publicUrl: null,
+    status: "running",
+    ...identity,
+  });
+  return { child, port };
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function spawnSleeper(): ChildProcess {
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    stdio: "ignore",
+    windowsHide: true,
+  });
+  bridges.push(child);
+  return child;
+}
+
+async function waitExit(child: ChildProcess, signal: NodeJS.Signals = "SIGKILL"): Promise<void> {
+  if (child.exitCode !== null || child.signalCode) return;
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("process did not exit")), 5000);
+    child.once("exit", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    if (child.pid) {
+      try {
+        process.kill(child.pid, signal);
+      } catch {
+        clearTimeout(timer);
+        resolve();
+      }
+    }
+  });
+}
+
 describe("dev dispatcher cross-repo", () => {
   it("reads and writes both rw mounts and rejects the ro mount", async () => {
     states.push(isolateStateDir());
@@ -54,7 +211,7 @@ describe("dev dispatcher cross-repo", () => {
       mode: "poc",
     });
     const env = createDevEnvironment(profile, new Date().toISOString());
-    persist(env);
+    await persistLive(env);
     const snapshot = captureDevCapability(env);
 
     const readResearch = await dispatchDevTool(env, snapshot, {
@@ -157,7 +314,7 @@ describe("dev dispatcher cross-repo", () => {
       mode: "poc",
     });
     const env = createDevEnvironment(profile, new Date().toISOString());
-    persist(env);
+    await persistLive(env);
     const snapshot = captureDevCapability(env);
 
     const envRead = await dispatchDevTool(env, snapshot, {
@@ -272,7 +429,7 @@ describe("dev dispatcher cross-repo", () => {
       mode: "poc",
     });
     const env = createDevEnvironment(profile, new Date().toISOString());
-    persist(env);
+    await persistLive(env);
     const snapshot = captureDevCapability(env);
     const visible = await dispatchDevTool(env, snapshot, {
       tool: "read_file",
@@ -309,7 +466,7 @@ describe("dev dispatcher cross-repo", () => {
       mode: "poc",
     });
     const env = createDevEnvironment(profile, new Date().toISOString());
-    persist(env);
+    await persistLive(env);
     const snapshot = captureDevCapability(env);
     fs.rmSync(path.join(research, ".env"));
     write(research, ".env", "PRIVATE_KEY=new-inode\n");
@@ -339,7 +496,7 @@ describe("dev dispatcher cross-repo", () => {
         mode: "poc",
       });
       const env = createDevEnvironment(profile, new Date().toISOString());
-      persist(env);
+      await persistLive(env);
       const snapshot = captureDevCapability(env);
       write(contracts, "dump-env.mjs", "console.log(JSON.stringify(process.env))\n");
       const nodePoc = await dispatchDevTool(env, snapshot, {
@@ -393,6 +550,208 @@ describe("dev dispatcher cross-repo", () => {
     });
     expect(later.ok).toBe(false);
     expect(later.error?.code).toBe("DEV_WORKSPACE_NOT_ATTACHED");
+  });
+});
+
+describe("dev capability liveness", () => {
+  it("allows write_file and run_poc while the Bridge is live", async () => {
+    states.push(isolateStateDir());
+    const research = repo("live-research", { "docs/a.md": "before\n" });
+    const contracts = repo("live-contracts", { "src/A.sol": "contract A {}\n" });
+    const pocProfile = buildProfileFromFlags({
+      name: "liveok",
+      mounts: [`research=${research}`, `contracts=${contracts}`],
+      mode: "poc",
+    });
+    const pocEnv = createDevEnvironment(pocProfile, new Date().toISOString());
+    await persistLive(pocEnv);
+    const pocSnapshot = captureDevCapability(pocEnv);
+    expect(await findDevObservation(pocEnv.name)).toMatchObject({ state: "healthy" });
+
+    const written = await dispatchDevTool(pocEnv, pocSnapshot, {
+      tool: "write_file",
+      workspace: "research",
+      arguments: { path: "docs/out.md", content: "after\n" },
+    });
+    expect(written.ok).toBe(true);
+    expect(fs.readFileSync(path.join(research, "docs/out.md"), "utf8")).toBe("after\n");
+
+    write(contracts, "hello.mjs", "console.log('poc-ok')\n");
+    const poc = await dispatchDevTool(pocEnv, pocSnapshot, {
+      tool: "run_poc",
+      workspace: "contracts",
+      arguments: { program: "node", args: ["hello.mjs"] },
+    });
+    expect(poc.ok).toBe(true);
+    expect(JSON.stringify(poc.result)).toContain("poc-ok");
+
+    const writeOnly = repo("write-research", { "docs/a.md": "keep\n" });
+    const writeContracts = repo("write-contracts", { "src/A.sol": "contract A {}\n" });
+    const writeProfile = buildProfileFromFlags({
+      name: "livewrite",
+      mounts: [`research=${writeOnly}`, `contracts=${writeContracts}`],
+      mode: "write",
+    });
+    const writeEnv = createDevEnvironment(writeProfile, new Date().toISOString());
+    await persistLive(writeEnv);
+    const writeSnapshot = captureDevCapability(writeEnv);
+    write(writeContracts, "hello.mjs", "console.log('should-not-run')\n");
+    const denied = await dispatchDevTool(writeEnv, writeSnapshot, {
+      tool: "run_poc",
+      workspace: "contracts",
+      arguments: { program: "node", args: ["hello.mjs"] },
+    });
+    expect(denied.ok).toBe(false);
+    expect(denied.error?.code).toBe("POC_NOT_ALLOWED");
+  });
+
+  it("revokes write_file and run_poc after the Bridge is SIGKILL'd with a stale runtime", async () => {
+    states.push(isolateStateDir());
+    const research = repo("killed-research", { "docs/a.md": "orig\n" });
+    const contracts = repo("killed-contracts", { "src/A.sol": "contract A {}\n" });
+    const profile = buildProfileFromFlags({
+      name: "killed",
+      mounts: [`research=${research}`, `contracts=${contracts}`],
+      mode: "poc",
+    });
+    const env = createDevEnvironment(profile, new Date().toISOString());
+    const { child } = await persistLive(env);
+    const snapshot = captureDevCapability(env);
+    const runtime = readDevRuntime(env.name);
+    expect(runtime?.status).toBe("running");
+    expect(child.pid).toBeTruthy();
+    await waitExit(child);
+    writeDevRuntime({
+      ...runtime!,
+      pid: child.pid!,
+      status: "running",
+    });
+    expect(readDevRuntime(env.name)?.status).toBe("running");
+
+    const written = await dispatchDevTool(env, snapshot, {
+      tool: "write_file",
+      workspace: "research",
+      arguments: { path: "docs/a.md", content: "mutated\n" },
+    });
+    expect(written.ok).toBe(false);
+    expect(written.error?.code).toBe("DEV_CAPABILITY_REVOKED");
+    expect(fs.readFileSync(path.join(research, "docs/a.md"), "utf8")).toBe("orig\n");
+
+    write(contracts, "touch.mjs", "import fs from 'node:fs'; fs.writeFileSync('POISON', 'x');\n");
+    const poc = await dispatchDevTool(env, snapshot, {
+      tool: "run_poc",
+      workspace: "contracts",
+      arguments: { program: "node", args: ["touch.mjs"] },
+    });
+    expect(poc.ok).toBe(false);
+    expect(poc.error?.code).toBe("DEV_CAPABILITY_REVOKED");
+    expect(fs.existsSync(path.join(contracts, "POISON"))).toBe(false);
+  });
+
+  it("does not treat a restarted session with a new startedAt as healthy", async () => {
+    states.push(isolateStateDir());
+    const research = repo("session-research", { "docs/a.md": "orig\n" });
+    const contracts = repo("session-contracts", { "src/A.sol": "contract A {}\n" });
+    const profile = buildProfileFromFlags({
+      name: "session",
+      mounts: [`research=${research}`, `contracts=${contracts}`],
+      mode: "poc",
+    });
+    const t1 = new Date("2026-01-01T00:00:00.000Z").toISOString();
+    const t2 = new Date("2026-01-01T00:01:00.000Z").toISOString();
+    const env = createDevEnvironment(profile, t1);
+    await persistLive(env, { healthStartedAt: t2 });
+    expect(env.startedAt).toBe(t1);
+    expect(readDevRuntime(env.name)?.devStartedAt).toBe(t1);
+    expect(await findDevObservation(env.name)).toMatchObject({
+      state: "unknown",
+      reason: "session_mismatch",
+    });
+  });
+
+  it("revokes mutable actions when the recorded PID is reused by an unrelated process", async () => {
+    states.push(isolateStateDir());
+    const research = repo("reuse-research", { "docs/a.md": "orig\n" });
+    const contracts = repo("reuse-contracts", { "src/A.sol": "contract A {}\n" });
+    const profile = buildProfileFromFlags({
+      name: "pidreuse",
+      mounts: [`research=${research}`, `contracts=${contracts}`],
+      mode: "poc",
+    });
+    const env = createDevEnvironment(profile, new Date().toISOString());
+    const sleeper = spawnSleeper();
+    if (!sleeper.pid) throw new Error("failed to spawn sleeper");
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline) {
+      try {
+        process.kill(sleeper.pid, 0);
+        break;
+      } catch {
+        await delay(20);
+      }
+    }
+    await persistLive(env, { recordedPid: sleeper.pid });
+    expect(await findDevObservation(env.name)).toMatchObject({ state: "healthy" });
+    const snapshot = captureDevCapability(env);
+
+    const written = await dispatchDevTool(env, snapshot, {
+      tool: "write_file",
+      workspace: "research",
+      arguments: { path: "docs/a.md", content: "mutated\n" },
+    });
+    expect(written.ok).toBe(false);
+    expect(written.error?.code).toBe("DEV_CAPABILITY_REVOKED");
+    expect(fs.readFileSync(path.join(research, "docs/a.md"), "utf8")).toBe("orig\n");
+
+    write(contracts, "touch.mjs", "import fs from 'node:fs'; fs.writeFileSync('POISON', 'x');\n");
+    const poc = await dispatchDevTool(env, snapshot, {
+      tool: "run_poc",
+      workspace: "contracts",
+      arguments: { program: "node", args: ["touch.mjs"] },
+    });
+    expect(poc.ok).toBe(false);
+    expect(poc.error?.code).toBe("DEV_CAPABILITY_REVOKED");
+    expect(fs.existsSync(path.join(contracts, "POISON"))).toBe(false);
+  });
+
+  it("revokes mutable actions when the owner command hash does not match", async () => {
+    states.push(isolateStateDir());
+    const research = repo("hash-research", { "docs/a.md": "orig\n" });
+    const contracts = repo("hash-contracts", { "src/A.sol": "contract A {}\n" });
+    const profile = buildProfileFromFlags({
+      name: "hashmiss",
+      mounts: [`research=${research}`, `contracts=${contracts}`],
+      mode: "poc",
+    });
+    const env = createDevEnvironment(profile, new Date().toISOString());
+    await persistLive(env);
+    const snapshot = captureDevCapability(env);
+    const runtime = readDevRuntime(env.name);
+    expect(runtime).toBeTruthy();
+    writeDevRuntime({
+      ...runtime!,
+      commandHash: "0".repeat(64),
+    });
+    expect(await findDevObservation(env.name)).toMatchObject({ state: "healthy" });
+
+    const written = await dispatchDevTool(env, snapshot, {
+      tool: "write_file",
+      workspace: "research",
+      arguments: { path: "docs/a.md", content: "mutated\n" },
+    });
+    expect(written.ok).toBe(false);
+    expect(written.error?.code).toBe("DEV_CAPABILITY_REVOKED");
+    expect(fs.readFileSync(path.join(research, "docs/a.md"), "utf8")).toBe("orig\n");
+
+    write(contracts, "touch.mjs", "import fs from 'node:fs'; fs.writeFileSync('POISON', 'x');\n");
+    const poc = await dispatchDevTool(env, snapshot, {
+      tool: "run_poc",
+      workspace: "contracts",
+      arguments: { program: "node", args: ["touch.mjs"] },
+    });
+    expect(poc.ok).toBe(false);
+    expect(poc.error?.code).toBe("DEV_CAPABILITY_REVOKED");
+    expect(fs.existsSync(path.join(contracts, "POISON"))).toBe(false);
   });
 });
 

@@ -159,13 +159,20 @@ function observePid(pid: number): "present" | "missing" | "unknown" {
 export type DevBridgeObservation =
   | { state: "healthy"; runtime: DevRuntimeState }
   | { state: "stopped"; runtime: DevRuntimeState | null; reason: "runtime_missing" | "pid_missing" }
-  | { state: "unknown"; runtime: DevRuntimeState | null; reason: "probe_failed" | "pid_unknown" | "environment_mismatch" };
+  | {
+      state: "unknown";
+      runtime: DevRuntimeState | null;
+      reason: "probe_failed" | "pid_unknown" | "environment_mismatch" | "session_mismatch";
+    };
 
 export async function findDevObservation(name: string): Promise<DevBridgeObservation> {
   const runtime = readDevRuntime(name);
   if (!runtime) return { state: "stopped", runtime: null, reason: "runtime_missing" };
   const health = await probeDevBridge(runtime.port);
   if (health && health.environmentId === runtime.environmentId) {
+    if (health.startedAt !== runtime.devStartedAt || health.environmentName !== runtime.environmentName) {
+      return { state: "unknown", runtime, reason: "session_mismatch" };
+    }
     return { state: "healthy", runtime };
   }
   if (health) return { state: "unknown", runtime, reason: "environment_mismatch" };

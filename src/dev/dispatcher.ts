@@ -9,7 +9,8 @@ import { sanitizeExecutionOutput } from "../execution/sanitize.js";
 import { type WebToolName } from "../web/protocol.js";
 import { DevError } from "./errors.js";
 import type { DevCapabilitySnapshot, DevEnvironment } from "./environment.js";
-import { assertLiveCapability, readDevRuntime } from "./runtime.js";
+import { assertLiveCapability, findDevObservation, isProvenDevOwner } from "./runtime.js";
+import { inspectProcess } from "../web/state.js";
 import { DEV_TOOLS, type DevToolName } from "./protocol.js";
 
 export interface DevDispatchResult {
@@ -177,14 +178,24 @@ function scopeFor(snapshot: DevCapabilitySnapshot, alias: string): WriteScopeSta
   };
 }
 
-function assertMutable(
+async function assertMutable(
   env: DevEnvironment,
   snapshot: DevCapabilitySnapshot,
   alias: string,
   tool: WebToolName
-): WriteScopeState {
-  const live = readDevRuntime(env.name);
-  assertLiveCapability(snapshot, live);
+): Promise<WriteScopeState> {
+  const observation = await findDevObservation(env.name);
+  if (observation.state !== "healthy") {
+    throw new DevError("DEV_CAPABILITY_REVOKED", "Development environment Bridge is not running");
+  }
+  assertLiveCapability(snapshot, observation.runtime);
+  const live = inspectProcess(observation.runtime.pid);
+  if (!isProvenDevOwner(observation.runtime, live)) {
+    throw new DevError(
+      "DEV_CAPABILITY_REVOKED",
+      "Development environment owner identity could not be proven"
+    );
+  }
   const mount = env.get(alias);
   if (mount.access === "ro") {
     throw new DevError("DEV_WORKSPACE_READ_ONLY", `Workspace '${alias}' is read-only`);
@@ -308,7 +319,7 @@ export async function dispatchDevTool(
         };
       case "write_file": {
         const parsed = writeArgs.parse(args);
-        const scope = assertMutable(env, snapshot, alias, "write_file");
+        const scope = await assertMutable(env, snapshot, alias, "write_file");
         const written = await writeFileWithinScope({
           workspace,
           scope,
@@ -320,7 +331,7 @@ export async function dispatchDevTool(
       }
       case "run_poc": {
         const parsed = pocArgs.parse(args);
-        const scope = assertMutable(env, snapshot, alias, "run_poc");
+        const scope = await assertMutable(env, snapshot, alias, "run_poc");
         const poc = await runPoc({
           workspace,
           scope,
