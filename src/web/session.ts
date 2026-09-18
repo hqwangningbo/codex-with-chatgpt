@@ -78,6 +78,7 @@ export interface ChatSession {
 
 export interface InteractiveChatSession extends ChatSession {
   waitForNextManualExchange(opts?: SendWaitOptions): Promise<string>;
+  acknowledgedBaseline(): SendBaseline;
 }
 
 export interface SendWaitOptions {
@@ -187,6 +188,10 @@ export class PlaywrightChatSession implements InteractiveChatSession {
   private guardContext(): void {
     for (const page of this.context.pages()) this.guardPage(page);
     this.context.on("page", (page) => this.guardPage(page));
+  }
+
+  acknowledgedBaseline(): SendBaseline {
+    return copySendBaseline(this.seen);
   }
 
   async snapshot(): Promise<ChatGptSnapshot> {

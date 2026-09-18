@@ -14,7 +14,7 @@ import {
 } from "./protocol.js";
 import { CHAT_READY, chatBootstrapPrompt } from "./prompt.js";
 import type { InteractiveChatSession } from "./session.js";
-import { uniqueIds, mergeSeenTurns, newBoundUserTurns, copySendBaseline, type SendBaseline } from "./selectors.js";
+import { checkConcurrentUser } from "./selectors.js";
 import { activeWebTask, observeWebTask, writeWebRuntime } from "./state.js";
 
 export interface ChatInput {
@@ -52,27 +52,18 @@ export async function runWebChat(input: ChatInput): Promise<ChatResult> {
 
   const seenCallIds = new Set<string>();
   let totalSteps = 0;
-  let seenTurns: SendBaseline = copySendBaseline({
-    assistantTurnIds: [],
-    turnContainerIds: [],
-    userTurnIds: [],
-    userIdByContainer: {},
-  });
-
-  const syncKnownTurns = async (): Promise<void> => {
-    seenTurns = mergeSeenTurns(seenTurns, await input.session.snapshot());
-  };
 
   const assertNoConcurrentUser = async (): Promise<void> => {
-    const snap = await input.session.snapshot();
-    const live = uniqueIds(snap.userTurnIds.filter((id) => id && id.trim()));
-    if (!live.ok) {
+    const checked = checkConcurrentUser(input.session.acknowledgedBaseline(), await input.session.snapshot());
+    if (checked.status === "fail") {
       throw new WebError(
-        live.reason === "duplicate" ? "WEB_TURN_AMBIGUOUS" : "WEB_TURN_STATE_UNKNOWN",
-        "ChatGPT user turns were not unique during the tool chain"
+        checked.code,
+        checked.code === "WEB_TURN_AMBIGUOUS"
+          ? "ChatGPT turns were not unique during the tool chain"
+          : "ChatGPT turn identity could not be proven during the tool chain"
       );
     }
-    if (newBoundUserTurns(seenTurns, snap).length > 0) {
+    if (checked.status === "concurrent") {
       throw new WebError(
         "WEB_CHAT_CONCURRENT_USER_TURN",
         "A new human user turn arrived while a tool chain was active"
@@ -96,7 +87,6 @@ export async function runWebChat(input: ChatInput): Promise<ChatResult> {
             signal: input.signal,
             multipleUserTurns: "concurrent",
           });
-          await syncKnownTurns();
           continue;
         }
         throw new WebError("WEB_PROTOCOL_INVALID", parsed.message);
@@ -122,14 +112,12 @@ export async function runWebChat(input: ChatInput): Promise<ChatResult> {
         }),
         { signal: input.signal, multipleUserTurns: "concurrent" }
       );
-      await syncKnownTurns();
       correctionUsed = false;
     }
   };
 
   try {
     await input.session.ensureReady();
-    await syncKnownTurns();
     const ready = await input.session.sendAndWait(
       chatBootstrapPrompt({
         sessionId,
@@ -138,7 +126,6 @@ export async function runWebChat(input: ChatInput): Promise<ChatResult> {
       }),
       { signal: input.signal }
     );
-    await syncKnownTurns();
     if (ready.trim() !== CHAT_READY) {
       throw new WebError("WEB_PROTOCOL_INVALID", "Chat bootstrap did not reply C2C CHAT READY");
     }
@@ -152,12 +139,10 @@ export async function runWebChat(input: ChatInput): Promise<ChatResult> {
         if (input.signal?.aborted) break;
         throw error;
       }
-      await syncKnownTurns();
       try {
         await processAssistant(text);
       } catch (error) {
         if (error instanceof WebError && recoverableChatError(error.code)) {
-          await syncKnownTurns();
           continue;
         }
         throw error;

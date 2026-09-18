@@ -12,6 +12,7 @@ import {
   mergeSeenTurns,
   copySendBaseline,
   newBoundUserTurns,
+  checkConcurrentUser,
   type ChatGptSnapshot,
   type SendBaseline,
 } from "../src/web/selectors.js";
@@ -270,6 +271,50 @@ describe("ChatGPT page fixtures", () => {
       });
     expect(watchSentTurn(before, after).status).toBe("waiting");
     expect(newBoundUserTurns(before, after)).toEqual([]);
+    expect(checkConcurrentUser(before, after).status).toBe("clear");
+  });
+
+  it("fail-closes concurrent checks when container identity is missing or duplicate", () => {
+    const before = baseline({
+      userTurnIds: ["u-1"],
+      turnContainerIds: ["c-1"],
+      userIdByContainer: { "c-1": "u-1" },
+    });
+    const duplicate = snapshot({
+      userTurnIds: ["u-1", "u-2"],
+      turnContainerIds: ["c-1", "c-2", "c-2"],
+      userIdByContainer: { "c-1": "u-1", "c-2": "u-2" },
+    });
+    expect(newBoundUserTurns(before, duplicate)).toEqual([]);
+    expect(checkConcurrentUser(before, duplicate)).toMatchObject({
+      status: "fail",
+      code: "WEB_TURN_AMBIGUOUS",
+    });
+    const missing = snapshot({
+      userTurnIds: ["u-1", "u-2"],
+      turnContainerIds: ["c-1", ""],
+      userIdByContainer: { "c-1": "u-1" },
+    });
+    expect(newBoundUserTurns(before, missing)).toEqual([]);
+    expect(checkConcurrentUser(before, missing)).toMatchObject({
+      status: "fail",
+      code: "WEB_TURN_STATE_UNKNOWN",
+    });
+    const unbound = snapshot({
+      userTurnIds: ["u-1", "u-2"],
+      turnContainerIds: ["c-1"],
+      userIdByContainer: { "c-1": "u-1" },
+    });
+    expect(checkConcurrentUser(before, unbound)).toMatchObject({
+      status: "fail",
+      code: "WEB_TURN_STATE_UNKNOWN",
+    });
+    const concurrent = snapshot({
+      userTurnIds: ["u-1", "u-2"],
+      turnContainerIds: ["c-1", "c-2"],
+      userIdByContainer: { "c-1": "u-1", "c-2": "u-2" },
+    });
+    expect(checkConcurrentUser(before, concurrent).status).toBe("concurrent");
   });
 
   it("treats login or drift after send as WEB_TURN_STATE_UNKNOWN", () => {

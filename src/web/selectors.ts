@@ -185,6 +185,33 @@ export function newBoundUserTurns(
   return bound;
 }
 
+export type ConcurrentUserCheck =
+  | { status: "clear" }
+  | { status: "concurrent" }
+  | { status: "fail"; code: "WEB_TURN_AMBIGUOUS" | "WEB_TURN_STATE_UNKNOWN" };
+
+export function checkConcurrentUser(baseline: SendBaseline, snapshot: ChatGptSnapshot): ConcurrentUserCheck {
+  const users = uniqueIds(snapshot.userTurnIds);
+  if (!users.ok) {
+    return { status: "fail", code: users.reason === "duplicate" ? "WEB_TURN_AMBIGUOUS" : "WEB_TURN_STATE_UNKNOWN" };
+  }
+  const containers = uniqueIds(snapshot.turnContainerIds);
+  if (!containers.ok) {
+    return { status: "fail", code: containers.reason === "duplicate" ? "WEB_TURN_AMBIGUOUS" : "WEB_TURN_STATE_UNKNOWN" };
+  }
+  if (users.ids.length > 0 && containers.ids.length === 0) {
+    return { status: "fail", code: "WEB_TURN_STATE_UNKNOWN" };
+  }
+  const boundUserIds = Object.values(snapshot.userIdByContainer).filter((id) => id && id.trim());
+  for (const userId of users.ids) {
+    if (!boundUserIds.includes(userId)) {
+      return { status: "fail", code: "WEB_TURN_STATE_UNKNOWN" };
+    }
+  }
+  if (newBoundUserTurns(baseline, snapshot).length > 0) return { status: "concurrent" };
+  return { status: "clear" };
+}
+
 /**
  * After a send click, bind the reply to a unique new logical container.
  * Visible assistant remounts of old containers are not this send's response.

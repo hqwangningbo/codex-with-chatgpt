@@ -16,8 +16,8 @@ import {
 import { CHAT_READY } from "../src/web/prompt.js";
 import { CHAIN_MAX_STEPS, runWebChat } from "../src/web/chat-turn.js";
 import type { InteractiveChatSession } from "../src/web/session.js";
-import type { ChatGptSnapshot } from "../src/web/selectors.js";
-import { watchSentTurn } from "../src/web/selectors.js";
+import type { ChatGptSnapshot, SendBaseline } from "../src/web/selectors.js";
+import { copySendBaseline, EMPTY_SEND_BASELINE, watchSentTurn } from "../src/web/selectors.js";
 import { cleanup, isolateStateDir, makeTmpDir, write } from "./helpers.js";
 
 function snapshot(over: Partial<ChatGptSnapshot> = {}): ChatGptSnapshot {
@@ -62,6 +62,7 @@ function chatEnvelope(
 }
 
 type Scripted = string | ((sessionId: string) => string);
+type SnapshotFault = "duplicate-containers" | "missing-containers";
 
 class FakeChatSession implements InteractiveChatSession {
   sent: string[] = [];
@@ -73,8 +74,11 @@ class FakeChatSession implements InteractiveChatSession {
   userByContainer: Record<string, string> = {};
   injectAfterSnapshots = -1;
   concurrentOnNextHuman = false;
+  injectAfterExchange = false;
+  snapshotFault: SnapshotFault | null = null;
   onAfterBootstrap?: () => void;
   private n = 0;
+  private seen: SendBaseline = copySendBaseline(EMPTY_SEND_BASELINE);
 
   constructor(private readonly ac: AbortController) {}
 
@@ -89,12 +93,25 @@ class FakeChatSession implements InteractiveChatSession {
     this.userByContainer[container] = id;
   }
 
+  private acknowledgeVisible(): void {
+    this.seen = {
+      assistantTurnIds: [...this.seen.assistantTurnIds],
+      turnContainerIds: [...this.containerIds],
+      userTurnIds: [...this.userTurns],
+      userIdByContainer: { ...this.userByContainer },
+    };
+  }
+
   private currentSnapshot(): ChatGptSnapshot {
     return snapshot({
       userTurnIds: [...this.userTurns],
       turnContainerIds: [...this.containerIds],
       userIdByContainer: { ...this.userByContainer },
     });
+  }
+
+  acknowledgedBaseline(): SendBaseline {
+    return copySendBaseline(this.seen);
   }
 
   async snapshot(): Promise<ChatGptSnapshot> {
@@ -104,10 +121,18 @@ class FakeChatSession implements InteractiveChatSession {
     } else if (this.injectAfterSnapshots > 0) {
       this.injectAfterSnapshots -= 1;
     }
-    return this.currentSnapshot();
+    const snap = this.currentSnapshot();
+    if (this.snapshotFault === "duplicate-containers") {
+      return { ...snap, turnContainerIds: [...snap.turnContainerIds, ...snap.turnContainerIds] };
+    }
+    if (this.snapshotFault === "missing-containers") {
+      return { ...snap, turnContainerIds: snap.turnContainerIds.map(() => ""), userIdByContainer: {} };
+    }
+    return snap;
   }
 
   async ensureReady(): Promise<ChatGptSnapshot> {
+    this.acknowledgeVisible();
     return this.currentSnapshot();
   }
 
@@ -116,6 +141,7 @@ class FakeChatSession implements InteractiveChatSession {
     const match = text.match(/^session_id: (\S+)$/m);
     if (match) this.sessionId = match[1];
     this.recordUser(`u-harness-${this.n++}`);
+    this.acknowledgeVisible();
     const next = this.sendReplies.shift();
     if (next === undefined) throw new Error("no scripted send reply");
     const reply = this.resolve(next);
@@ -130,7 +156,12 @@ class FakeChatSession implements InteractiveChatSession {
       throw new WebError("WEB_TIMEOUT", "Web session was cancelled");
     }
     this.recordUser(`u-human-${this.n++}`);
-    if (this.concurrentOnNextHuman) this.injectAfterSnapshots = 1;
+    this.acknowledgeVisible();
+    if (this.injectAfterExchange) {
+      this.injectAfterExchange = false;
+      this.recordUser("u-late-human");
+    }
+    if (this.concurrentOnNextHuman) this.injectAfterSnapshots = 0;
     return this.resolve(next);
   }
 
@@ -142,6 +173,8 @@ async function runScriptedChat(input: {
   sendReplies: Scripted[];
   humanQueue?: Scripted[];
   injectConcurrentAfterSync?: boolean;
+  injectAfterExchange?: boolean;
+  snapshotFault?: SnapshotFault;
   onAfterBootstrap?: () => void;
 }): Promise<{ result: Awaited<ReturnType<typeof runWebChat>>; session: FakeChatSession }> {
   const ac = new AbortController();
@@ -150,6 +183,8 @@ async function runScriptedChat(input: {
   session.humanQueue = [...(input.humanQueue ?? [])];
   session.onAfterBootstrap = input.onAfterBootstrap;
   session.concurrentOnNextHuman = Boolean(input.injectConcurrentAfterSync);
+  session.injectAfterExchange = Boolean(input.injectAfterExchange);
+  session.snapshotFault = input.snapshotFault ?? null;
   const result = await runWebChat({
     workspace: new Workspace(input.root),
     session,
@@ -436,6 +471,110 @@ describe("web chat writable dispatcher", () => {
     expect(fs.existsSync(path.join(root, "docs/research/late.md"))).toBe(false);
     expect(after.session.sent[1]).toContain("WEB_CAPABILITY_REVOKED");
   });
+
+  it("does not execute write_file when a new human turn arrives before mutable dispatch", async () => {
+    setWriteScope({
+      workspaceId: workspace.id,
+      root: "docs/research",
+      mode: "write",
+      bridgeStartedAt: (await captureCapabilitySnapshot(workspace)).bridgeStartedAt ?? "missing",
+    });
+    const target = path.join(root, "docs/research/race-concurrent.md");
+    const { session } = await runScriptedChat({
+      root,
+      sendReplies: [CHAT_READY],
+      humanQueue: [
+        (id) => chatEnvelope(id, "write_file", { path: "docs/research/race-concurrent.md", content: "pwn\n" }, "w-race"),
+      ],
+      injectConcurrentAfterSync: true,
+    });
+    expect(fs.existsSync(target)).toBe(false);
+    expect(session.sent.join("\n")).not.toContain("<C2C_TOOL_RESULT>");
+  });
+
+  it("fail-closes duplicate turnContainerIds before write_file", async () => {
+    setWriteScope({
+      workspaceId: workspace.id,
+      root: "docs/research",
+      mode: "write",
+      bridgeStartedAt: (await captureCapabilitySnapshot(workspace)).bridgeStartedAt ?? "missing",
+    });
+    const target = path.join(root, "docs/research/race-duplicate.md");
+    const { session, result } = await runScriptedChat({
+      root,
+      sendReplies: [CHAT_READY],
+      humanQueue: [
+        (id) => chatEnvelope(id, "write_file", { path: "docs/research/race-duplicate.md", content: "pwn\n" }, "w-dup"),
+      ],
+      snapshotFault: "duplicate-containers",
+    });
+    expect(fs.existsSync(target)).toBe(false);
+    expect(session.sent.join("\n")).not.toContain("<C2C_TOOL_RESULT>");
+    expect(result.status).toBe("failed");
+    expect(result.error?.code).toBe("WEB_TURN_AMBIGUOUS");
+  });
+
+  it("fail-closes missing container ids before write_file or run_poc", async () => {
+    setWriteScope({
+      workspaceId: workspace.id,
+      root: "docs/research",
+      mode: "write",
+      bridgeStartedAt: (await captureCapabilitySnapshot(workspace)).bridgeStartedAt ?? "missing",
+    });
+    const target = path.join(root, "docs/research/race-missing.md");
+    const { session, result } = await runScriptedChat({
+      root,
+      sendReplies: [CHAT_READY],
+      humanQueue: [
+        (id) => chatEnvelope(id, "write_file", { path: "docs/research/race-missing.md", content: "pwn\n" }, "w-miss"),
+      ],
+      snapshotFault: "missing-containers",
+    });
+    expect(fs.existsSync(target)).toBe(false);
+    expect(session.sent.join("\n")).not.toContain("<C2C_TOOL_RESULT>");
+    expect(result.status).toBe("failed");
+    expect(result.error?.code).toBe("WEB_TURN_STATE_UNKNOWN");
+
+    setWriteScope({
+      workspaceId: workspace.id,
+      root: "docs/research",
+      mode: "poc",
+      bridgeStartedAt: (await captureCapabilitySnapshot(workspace)).bridgeStartedAt ?? "missing",
+    });
+    write(root, "docs/research/race-poc.mjs", "throw new Error('poc must not run');\n");
+    const poc = await runScriptedChat({
+      root,
+      sendReplies: [CHAT_READY],
+      humanQueue: [
+        (id) =>
+          chatEnvelope(id, "run_poc", { program: "node", args: ["docs/research/race-poc.mjs"] }, "poc-miss"),
+      ],
+      snapshotFault: "missing-containers",
+    });
+    expect(poc.session.sent.join("\n")).not.toContain("<C2C_TOOL_RESULT>");
+    expect(poc.result.status).toBe("failed");
+    expect(poc.result.error?.code).toBe("WEB_TURN_STATE_UNKNOWN");
+  });
+
+  it("does not absorb a human turn that arrives after the exchange and before processAssistant", async () => {
+    setWriteScope({
+      workspaceId: workspace.id,
+      root: "docs/research",
+      mode: "write",
+      bridgeStartedAt: (await captureCapabilitySnapshot(workspace)).bridgeStartedAt ?? "missing",
+    });
+    const target = path.join(root, "docs/research/race-absorb.md");
+    const { session } = await runScriptedChat({
+      root,
+      sendReplies: [CHAT_READY],
+      humanQueue: [
+        (id) => chatEnvelope(id, "write_file", { path: "docs/research/race-absorb.md", content: "pwn\n" }, "w-absorb"),
+      ],
+      injectAfterExchange: true,
+    });
+    expect(fs.existsSync(target)).toBe(false);
+    expect(session.sent.join("\n")).not.toContain("<C2C_TOOL_RESULT>");
+  });
 });
 
 describe("web chat remount safety", () => {
@@ -470,5 +609,12 @@ describe("web chat remount safety", () => {
       })
     );
     expect(watched).toMatchObject({ status: "fail", code: "WEB_TURN_AMBIGUOUS" });
+  });
+
+  it("does not advance acknowledged turns from an arbitrary snapshot", () => {
+    const source = fs.readFileSync(new URL("../src/web/chat-turn.ts", import.meta.url), "utf8");
+    expect(source).toContain("acknowledgedBaseline");
+    expect(source).not.toContain("mergeSeenTurns");
+    expect(source).not.toContain("syncKnownTurns");
   });
 });
